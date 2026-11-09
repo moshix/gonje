@@ -1,0 +1,22 @@
+# gonje.cnf - gonje NJE node configuration (copy to gonje.cnf)
+# key=value tokens separated by newlines, spaces or commas; '#' comments.
+
+local_node=MYNODE           # our NJE node name, 1-8 characters
+local_IP=0.0.0.0            # address to listen on
+local_port=175              # NJE over TCP/IP port (175 is the standard)
+send_dir=./outbox           # where 'ls' and 'send' look for files
+recv_dir=./inbox            # where received files are stored
+log_level=debug             # debug, info, warn or error
+split_view=yes              # no = start unsplit (or use -split=false)
+split_ratio=40              # event panel height in percent (split view)
+panel_level=1               # 1, 2 or 3 (see README)
+
+# One block per remote node; remote_host_name starts a new block.
+remote_host_name=REMNODE
+remote_host_addr=remote.node.com   # empty/omitted = wait for it to call us
+remote_host_port=175
+remote_keepalive=10                # seconds of idle before a null buffer
+remote_password=                   # optional node password
+remote_strict_bcb=no               # yes = manual BCB rules (E0 + drop)
+remote_turn=free                   # strict = BSC-style block alternation
+remote_eof_wait=10                 # seconds to wait for a file receipt (C0)

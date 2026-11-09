@@ -1,0 +1,18 @@
+# Local configuration (may contain hosts and passwords)
+gonje.cnf
+
+# Runtime output
+gonje.log
+*.log
+inbox/
+outbox/
+
+# Build output
+/gonje
+*.exe
+
+# build.sh output
+bin/
+
+# Claude Code local settings
+.claude/

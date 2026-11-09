@@ -1,0 +1,15 @@
+# Local test node A: talks to node B on this machine.
+local_node=NODEA
+local_IP=127.0.0.1
+local_port=1175
+send_dir=./test/nodeA/outbox
+recv_dir=./test/nodeA/inbox
+log_level=debug
+split_view=no
+split_ratio=40
+panel_level=2
+
+remote_host_name=NODEB
+remote_host_addr=127.0.0.1
+remote_host_port=2175
+remote_keepalive=10
