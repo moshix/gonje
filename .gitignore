@@ -24,3 +24,7 @@ deploy.sh
 moshix.sh
 release.sh
 test_against_houcics.sh
+
+# Private protocol notes (not published)
+DLE_STX.md
+vm_connection_trace.md
