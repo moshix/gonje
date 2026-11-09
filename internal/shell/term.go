@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -104,6 +106,7 @@ type tty struct {
 	fd         int
 	rows, cols int
 	dirty      bool
+	blinked    bool // a tag was blinking at the last check
 }
 
 func (s *Shell) runTTY(in, out *os.File, events <-chan link.Event, done <-chan struct{}) error {
@@ -168,6 +171,10 @@ func (s *Shell) runTTY(in, out *os.File, events <-chan link.Event, done <-chan s
 			if s.HandleEvent(ev) {
 				t.dirty = true
 			}
+			if s.bell {
+				s.bell = false
+				t.w.WriteString("\a")
+			}
 		case <-ticker.C:
 			// Poll the window size (portable; no SIGWINCH needed) and
 			// repaint after a resize, for new events, or when a divider
@@ -178,6 +185,12 @@ func (s *Shell) runTTY(in, out *os.File, events <-chan link.Event, done <-chan s
 				t.dirty = true
 			}
 			if tick%25 == 0 && s.noteText != "" {
+				t.dirty = true
+			}
+			// Blinking message tags: redraw every ~500 ms while they
+			// blink, plus one last time when they stop.
+			if tick%12 == 0 && (s.Blinking() || t.blinked) {
+				t.blinked = s.Blinking()
 				t.dirty = true
 			}
 			if t.dirty {

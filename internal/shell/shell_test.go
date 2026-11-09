@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -194,10 +196,11 @@ func TestPanelWrapsAtRenderTime(t *testing.T) {
 
 // fakeBackend implements Backend for command tests.
 type fakeBackend struct {
-	calls   []string
-	fail    bool
-	local   node.LocalInfo
-	remotes map[string]config.Remote
+	calls     []string
+	fail      bool
+	local     node.LocalInfo
+	remotes   map[string]config.Remote
+	lastRoute config.Route
 }
 
 func (f *fakeBackend) rec(s string) error {
@@ -215,7 +218,11 @@ func (f *fakeBackend) Status() []node.LinkStatus {
 		{Name: "NODEC", State: node.Down, Held: true, Queued: 2, LastErr: strings.Repeat("e", 120)},
 	}
 }
-func (f *fakeBackend) Local() node.LocalInfo  { return f.local }
+func (f *fakeBackend) Local() node.LocalInfo { return f.local }
+func (f *fakeBackend) SetTimeout(sec int) error {
+	f.local.Timeout = sec
+	return f.rec("timeout")
+}
 func (f *fakeBackend) Connect(n string) error { return f.rec("connect " + n) }
 func (f *fakeBackend) Drop(n string) error    { return f.rec("drop " + n) }
 func (f *fakeBackend) Drain(n string) (string, error) {
@@ -280,6 +287,16 @@ func (f *fakeBackend) Counters() node.Counters {
 		}}
 }
 func (f *fakeBackend) ResetCounters(n string) error { return f.rec("reset " + n) }
+func (f *fakeBackend) Routes() []node.RouteStatus {
+	return []node.RouteStatus{{Route: config.Route{Dest: "MVSF", Via: "MVSB", Alt: "MVSC"}, Using: "MVSC"},
+		{Route: config.Route{Dest: "*", Via: "MVSB"}, Default: true}}
+}
+func (f *fakeBackend) SetRoute(rt config.Route) error {
+	f.lastRoute = rt
+	return f.rec("route " + rt.String())
+}
+func (f *fakeBackend) DeleteRoute(d string) error     { return f.rec("route delete " + d) }
+func (f *fakeBackend) SetDefaultRoute(d string) error { return f.rec("route default " + d) }
 func (f *fakeBackend) DeleteLink(n string) (int, error) {
 	delete(f.remotes, n)
 	return 2, f.rec("delete " + n)
@@ -343,7 +360,7 @@ func TestExecCommands(t *testing.T) {
 	if len(s.Exec("").Lines) != 0 {
 		t.Fatal("empty line")
 	}
-	if v := s.Exec("version").Lines[0].Text; !strings.HasPrefix(v, "gonje 9.9 (go") || !strings.Contains(v, "/") {
+	if v := s.Exec("version").Lines[0].Text; v != "gonje 9.9" {
 		t.Fatalf("version %q", v)
 	}
 	for _, c := range []string{"help", "nodes", "status", "ls", "inbox", "log", "link list", "local"} {

@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package records
 
 import (
@@ -129,6 +131,7 @@ type JobHeader struct {
 	NRec       uint32
 	JobNo      uint32
 	NotifyNode string
+	Hops       uint16 // NJHGHOPS: nodes passed (store-and-forward)
 	Raw        []byte // full received header (all sections)
 }
 
@@ -144,6 +147,7 @@ func (h *JobHeader) Encode() []byte {
 	b[11] = orDefault(h.MsgClass, 0xC1)
 	b[13] = h.Priority
 	b[15] = orDefault(h.Copies, 1)
+	binary.BigEndian.PutUint16(b[18:20], h.Hops)
 	ebcdic.PutField(b[20:28], "")
 	ebcdic.PutField(b[28:36], h.JobName)
 	ebcdic.PutField(b[36:44], h.NotifyUser)
@@ -207,6 +211,7 @@ func ParseJobHeader(rec []byte) (*JobHeader, error) {
 			NRec:       binary.BigEndian.Uint32(g[196:200]),
 			JobNo:      binary.BigEndian.Uint32(g[200:204]),
 			NotifyNode: ebcdic.FieldString(g[204:212]),
+			Hops:       binary.BigEndian.Uint16(g[14:16]),
 			Raw:        append([]byte(nil), rec...),
 		}, nil
 	}

@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package link
 
 import (
@@ -56,13 +58,19 @@ func (h *fakeHandler) Dataset(_ string, ds *InboundDataset) {
 	h.poke()
 }
 
-func (h *fakeHandler) NextFile(string) *OutboundFile {
+func (h *fakeHandler) NextFile(_ string, busy []*OutboundFile) *OutboundFile {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.queue) == 0 {
-		return nil
+	for _, f := range h.queue {
+		skip := false
+		for _, b := range busy {
+			skip = skip || b == f
+		}
+		if !skip {
+			return f
+		}
 	}
-	return h.queue[0]
+	return nil
 }
 
 func (h *fakeHandler) FileDone(_ string, f *OutboundFile, err error) {
@@ -111,8 +119,8 @@ func pair(t *testing.T, ka time.Duration) (a, b *Session, ha, hb *fakeHandler) {
 	}
 	defer ln.Close()
 	ha, hb = newHandler(), newHandler()
-	pa := Params{Local: "NODEA", Remote: "NODEB", Keepalive: ka, Handler: ha, Handshake: 5 * time.Second}
-	pb := Params{Local: "NODEB", Remote: "NODEA", Keepalive: ka, Handler: hb, Handshake: 5 * time.Second}
+	pa := Params{Local: "NODEA", Remote: "NODEB", Keepalive: ka, Handler: ha, Handshake: 5 * time.Second, StreamSettle: time.Millisecond}
+	pb := Params{Local: "NODEB", Remote: "NODEA", Keepalive: ka, Handler: hb, Handshake: 5 * time.Second, StreamSettle: time.Millisecond}
 
 	errs := make(chan error, 2)
 	go func() {
@@ -332,7 +340,8 @@ func acceptRawP(t *testing.T, ka time.Duration, adj func(*Params)) (*Session, *r
 			errs <- err
 			return
 		}
-		p := Params{Local: "GONJE", Remote: "RAW", Keepalive: ka, Handler: h, Handshake: 5 * time.Second}
+		p := Params{Local: "GONJE", Remote: "RAW", Keepalive: ka, Handler: h, Handshake: 5 * time.Second,
+			StreamSettle: time.Millisecond}
 		adj(&p)
 		s := New(c, p)
 		sc <- s

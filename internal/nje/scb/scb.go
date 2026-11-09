@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package scb implements NJE non-SNA String Control Byte (SCB) compression
 // as used on BSC, CTC and TCP/IP links (SA32-0988 Ch.8 Table 48; see
 // docs/spec/03_link_protocols.md section 6).

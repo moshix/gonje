@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package node
 
 import (
@@ -25,6 +27,8 @@ type LinkCounters struct {
 	Total        link.Stats
 	RspsIn       int
 	RspsOut      int
+	BufSize      int // buffer size we advertise
+	MaxStreams   int // concurrent transfers each way
 }
 
 // Counters is the node-wide "stats" snapshot.
@@ -46,7 +50,8 @@ func (n *Node) Counters() Counters {
 		r := n.remotes[name]
 		lc := LinkCounters{Name: name, State: r.visibleState(), Held: r.held, LastErr: r.lastErr,
 			Connected: r.connected, Connects: r.connects, Failures: r.failures,
-			Total: r.totals, RspsIn: r.rspIn, RspsOut: r.rspOut}
+			Total: r.totals, RspsIn: r.rspIn, RspsOut: r.rspOut, BufSize: bufOrDefault(r.cfg.BufSize),
+			MaxStreams: max(r.cfg.MaxStreams, 1)}
 		if r.cfg.Addr != "" {
 			lc.Addr = net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
 		}

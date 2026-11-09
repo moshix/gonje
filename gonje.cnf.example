@@ -19,4 +19,4 @@ remote_keepalive=10                # seconds of idle before a null buffer
 remote_password=                   # optional node password
 remote_strict_bcb=no               # yes = manual BCB rules (E0 + drop)
 remote_turn=free                   # strict = BSC-style block alternation
-remote_eof_wait=10                 # seconds to wait for a file receipt (C0)
+remote_max_streams=1               # concurrent file transfers each way (1-8)

@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package link
 
 import (
@@ -77,11 +79,27 @@ func (s *Session) Kill() { _ = s.conn.Close() }
 // Drain switches graceful drop on or off: while draining, running
 // transfers finish, no new ones start (ours stay queued, the peer's
 // requests are refused), and the session signs off once idle.
+//
+// It returns only after Run has applied the change, so a request (90)
+// that arrives after Drain(true) returned is certainly refused. Callers
+// must not hold locks that the session goroutine may need.
 func (s *Session) Drain(on bool) {
+	ack := make(chan struct{})
 	select {
-	case s.drainCh <- on:
+	case s.drainCh <- drainReq{on: on, ack: ack}:
+	case <-s.done:
+		return
+	}
+	select {
+	case <-ack:
 	case <-s.done:
 	}
+}
+
+// drainReq asks Run to switch draining and confirms it via ack.
+type drainReq struct {
+	on  bool
+	ack chan struct{}
 }
 
 // Done is closed when Run has returned.
@@ -160,11 +178,26 @@ func (s *Session) Run() (err error) {
 			}
 			s.activity()
 		case err := <-s.errCh:
+			// Handle what the reader got before the error first: a peer
+			// that signs off and closes at once must end as a signoff,
+			// not as a lost connection (select picks channels randomly).
+			for {
+				select {
+				case rec := <-s.inCh:
+					if herr := s.handleInbound(rec, time.Now()); herr != nil {
+						return herr
+					}
+					continue
+				default:
+				}
+				break
+			}
 			return fmt.Errorf("connection lost: %w", err)
 		case <-s.kickCh:
-		case on := <-s.drainCh:
-			s.draining = on
+		case req := <-s.drainCh:
+			s.draining = req.on
 			s.activity()
+			close(req.ack)
 		case <-ticker.C:
 			if err := s.tick(time.Now()); err != nil {
 				return err
@@ -208,15 +241,12 @@ func (s *Session) finish(err error) {
 // idleForDrain reports that no transfer is in progress in either
 // direction and every stream reply (A0/B0/C0) has gone out.
 func (s *Session) idleForDrain() bool {
-	return s.tx.state == txIdle && len(s.rx) == 0 && len(s.ctlQueue) == 0
+	return s.txActive() == 0 && len(s.rx) == 0 && len(s.ctlQueue) == 0
 }
 
 // activity publishes the number of running transfers for "nodes"/drain.
 func (s *Session) activity() {
-	in, out := len(s.rx), 0
-	if s.tx.state != txIdle {
-		out = 1
-	}
+	in, out := len(s.rx), s.txActive()
 	s.count(func(st *Stats) { st.ActiveIn, st.ActiveOut, st.Draining = in, out, s.draining })
 }
 
@@ -336,16 +366,14 @@ func (s *Session) tick(now time.Time) error {
 	// never send C0 after our EOF. After EOFWait without C0, B0 or an
 	// error, the file counts as sent (unconfirmed) and the stream is
 	// freed; a late C0/B0 is logged and ignored.
-	if s.tx.state == txWaitAck && now.Sub(s.tx.since) > s.p.EOFWait {
-		s.log.Warn(fmt.Sprintf("no EOF acknowledgement (C0) for %s within %s: counted as sent", s.tx.f.Name, s.p.EOFWait))
-		s.txComplete(" (peer did not confirm receipt)")
-	}
-	if s.tx.state == txWaitPermit && now.Sub(s.tx.since) > streamTimeout {
-		what := "EOF acknowledgement"
-		if s.tx.state == txWaitPermit {
-			what = "permission"
+	for _, t := range s.txs {
+		if t.state == txWaitAck && now.Sub(t.since) > s.p.EOFWait {
+			s.log.Warn(fmt.Sprintf("no EOF acknowledgement (C0) for %s within %s: counted as sent", t.f.Name, s.p.EOFWait))
+			s.txComplete(t, " (peer did not confirm receipt)")
 		}
-		s.txFail(fmt.Errorf("timeout waiting for %s", what))
+		if t.state == txWaitPermit && now.Sub(t.since) > streamTimeout {
+			s.txFail(t, fmt.Errorf("timeout waiting for permission"))
+		}
 	}
 	return nil
 }
@@ -459,6 +487,10 @@ func (s *Session) handleInbound(rec []byte, now time.Time) error {
 		return nil
 	}
 	s.takeTurn(now, false, false)
+	if !s.settled && !s.signedOnAt.IsZero() {
+		s.settled = true // the peer's first post-signon data block
+		s.Kick()
+	}
 	for _, r := range buf.Records {
 		s.dumpRecord("<-", r)
 		if err := s.dispatch(r); err != nil {

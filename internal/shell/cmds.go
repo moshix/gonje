@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -35,7 +37,11 @@ func (s *Shell) exec(line string) Result {
 	case "stats":
 		return s.statsCmd(args)
 	case "nodes", "status":
-		return Result{Lines: s.statusLines()}
+		lines := s.statusLines()
+		if rs := s.be.Routes(); len(rs) > 0 {
+			lines = append(lines, Line{Text: fmt.Sprintf("%d route(s), see route list", len(rs)), Color: Dim})
+		}
+		return Result{Lines: lines}
 	case "connect":
 		if len(args) < 1 {
 			return usage("connect <node>")
@@ -94,6 +100,8 @@ func (s *Shell) exec(line string) Result {
 			Seg{fmt.Sprintf(" (%d records, %s)", len(f.Records), kind), Green})
 		l.Color = Green
 		return Result{Lines: []Line{l}}
+	case "spool", "sp":
+		return s.spoolCmd(args)
 	case "ls":
 		return Result{Lines: listDir(s.set.SendDir)}
 	case "inbox":
@@ -112,6 +120,10 @@ func (s *Shell) exec(line string) Result {
 		return s.localCmd(args)
 	case "link":
 		return s.linkCmd(args)
+	case "route":
+		return s.routeCmd(args)
+	case "routes":
+		return Result{Lines: s.routeLines()}
 	case "quit", "exit", "bye":
 		s.quitting = true
 		return Result{Quit: true, Lines: []Line{ok("closing links (no signoff) and exiting")}}
@@ -121,8 +133,16 @@ func (s *Shell) exec(line string) Result {
 
 // splitCmd: split on|off|<percent>.
 func (s *Shell) splitCmd(args []string) Result {
+	if len(args) == 2 && strings.EqualFold(args[0], "msgs") {
+		n, err := strconv.Atoi(args[1])
+		if err != nil || n < 3 || n > 50 {
+			return usage("split msgs <lines 3-50>")
+		}
+		s.msgLines = n
+		return Result{Lines: []Line{ok(fmt.Sprintf("messages pane %d lines", n))}}
+	}
 	if len(args) != 1 {
-		return usage("split on|off|<percent>")
+		return usage("split on|off|<percent>|msgs <lines>")
 	}
 	switch args[0] {
 	case "on":
@@ -175,8 +195,8 @@ func (s *Shell) statusLines() []Line {
 			if st.Stats.Primary {
 				role = "pri"
 			}
-			info = fmt.Sprintf("%s in %d/%d out %d/%d ka %d", role, st.Stats.MsgsIn, st.Stats.FilesIn,
-				st.Stats.MsgsOut, st.Stats.FilesOut, st.Stats.KeepaliveIn)
+			info = fmt.Sprintf("%s in %d/%d out %d/%d ka %d buf %d/%d str %d", role, st.Stats.MsgsIn, st.Stats.FilesIn,
+				st.Stats.MsgsOut, st.Stats.FilesOut, st.Stats.KeepaliveIn, st.BufSize, st.Stats.PeerBufSize, st.MaxStreams)
 		} else if st.Held {
 			info, infoColor = "held", Dim
 		}
@@ -206,7 +226,8 @@ func listDir(dir string) []Line {
 	}
 	var names []string
 	for _, e := range ents {
-		if !e.IsDir() {
+		// Hide received-file sidecars and partial writes.
+		if !e.IsDir() && !strings.HasSuffix(e.Name(), ".meta") && !strings.HasSuffix(e.Name(), ".part") {
 			names = append(names, e.Name())
 		}
 	}
@@ -286,10 +307,11 @@ func (s *Shell) localCmd(args []string) Result {
 			SegLine(Seg{"local node ", Default}, Seg{li.Name, BoldYellow}),
 			SegLine(Seg{"configured ", Default}, Seg{fmt.Sprintf("%s port %d", li.IP, li.Port), Cyan}),
 			SegLine(Seg{"listening  ", Default}, Seg{listen, Cyan}),
+			SegLine(Seg{"timeout    ", Default}, Seg{fmt.Sprintf("%d s (0 = retry forever)", li.Timeout), Cyan}),
 		}}
 	}
 	if len(args) != 2 {
-		return usage("local [name <node>|ip <addr>|port <n>] [save]")
+		return usage("local [name <node>|ip <addr>|port <n>|timeout <s>] [save]")
 	}
 	var out []Line
 	switch strings.ToLower(args[0]) {
@@ -332,6 +354,18 @@ func (s *Shell) localCmd(args []string) Result {
 		if save {
 			out = append(out, s.saveConfig(func(f *config.File) { f.SetLocal("local_IP", args[1]) }))
 		}
+	case "timeout":
+		sec, err := config.Timeout(args[1])
+		if err != nil {
+			return fail(fmt.Errorf("timeout: %v", err))
+		}
+		if err := s.be.SetTimeout(sec); err != nil {
+			return fail(err)
+		}
+		out = append(out, ok(fmt.Sprintf("timeout %d s (0 = retry forever)", sec)))
+		if save {
+			out = append(out, s.saveConfig(func(f *config.File) { f.SetLocal("timeout", strconv.Itoa(sec)) }))
+		}
 	case "port":
 		p, err := config.Port(args[1])
 		if err != nil {
@@ -345,7 +379,7 @@ func (s *Shell) localCmd(args []string) Result {
 			out = append(out, s.saveConfig(func(f *config.File) { f.SetLocal("local_port", strconv.Itoa(p)) }))
 		}
 	default:
-		return usage("local [name <node>|ip <addr>|port <n>] [save]")
+		return usage("local [name <node>|ip <addr>|port <n>|timeout <s>] [save]")
 	}
 	return Result{Lines: out}
 }
@@ -374,8 +408,10 @@ func applyLinkOpts(rc *config.Remote, words []string) error {
 			rc.Password, err = config.Password(v)
 		case "strict_bcb":
 			rc.StrictBCB, err = config.Bool(v)
-		case "eof_wait":
-			rc.EOFWait, err = config.Keepalive(v) // same 1-3600 s range
+		case "buffersize":
+			rc.BufSize, err = config.BufSize(v)
+		case "max_streams", "max-streams":
+			rc.MaxStreams, err = config.MaxStreams(v)
 		case "turn":
 			if v = strings.ToLower(v); v != "free" && v != "strict" {
 				err = fmt.Errorf("must be free or strict")
@@ -456,4 +492,129 @@ func (s *Shell) linkCmd(args []string) Result {
 		return Result{Lines: out}
 	}
 	return usage("link define|change|delete|list ...")
+}
+
+// routeCmd: route <dest> to <via> [alt <alt>] [save] | route delete
+// <dest> [save] | route default <node>|delete [save] | route list.
+// Words are case-insensitive ("ROUTE MVSF TO MVSB ALT MVSC").
+func (s *Shell) routeCmd(args []string) Result {
+	args, save := stripSave(args)
+	const use = "route <dest> to <via> [alt <alt>] [save] | route delete <dest> [save] | route default <node>|delete [save] | route list"
+	if len(args) == 0 {
+		return usage(use)
+	}
+	w := func(i int) string { return strings.ToLower(args[i]) }
+	var out []Line
+	switch {
+	case w(0) == "list" && len(args) == 1:
+		return Result{Lines: s.routeLines()}
+	case w(0) == "delete" && len(args) == 2:
+		dest := strings.ToUpper(args[1])
+		if err := s.be.DeleteRoute(dest); err != nil {
+			return fail(err)
+		}
+		out = append(out, ok("route to "+dest+" deleted"))
+		if save {
+			out = append(out, s.saveConfig(func(f *config.File) { f.DeleteRoute(dest) }))
+		}
+	case w(0) == "default" && len(args) == 2:
+		name := strings.ToUpper(args[1])
+		if w(1) == "delete" {
+			name = ""
+		}
+		if err := s.be.SetDefaultRoute(name); err != nil {
+			return fail(err)
+		}
+		if name == "" {
+			out = append(out, ok("default route removed"))
+		} else {
+			out = append(out, ok("default route via "+name))
+		}
+		if save {
+			out = append(out, s.saveConfig(func(f *config.File) {
+				if name == "" {
+					f.DeleteLocal("default_route")
+				} else {
+					f.SetLocal("default_route", name)
+				}
+			}))
+		}
+	case (len(args) == 3 || len(args) == 5) && w(1) == "to" && (len(args) == 3 || w(3) == "alt"):
+		rt := config.Route{Dest: args[0], Via: args[2]}
+		if len(args) == 5 {
+			rt.Alt = args[4]
+		}
+		var err error
+		if rt, err = config.ParseRoute(rt.String()); err != nil {
+			return fail(err)
+		}
+		if err := s.be.SetRoute(rt); err != nil {
+			return fail(err)
+		}
+		text := "route to " + rt.Dest + " via " + rt.Via
+		if rt.Alt != "" {
+			text += " (alt " + rt.Alt + ")"
+		}
+		out = append(out, ok(text))
+		if save {
+			out = append(out, s.saveConfig(func(f *config.File) { f.SetRoute(rt) }))
+		}
+	default:
+		return usage(use)
+	}
+	return Result{Lines: out}
+}
+
+// routeLines is the "routes" / "route list" table: one row for every
+// defined remote (direct) and every route destination, with the state
+// of the link actually used, plus a "* default" row.
+func (s *Shell) routeLines() []Line {
+	state := map[string]node.State{}
+	var order []string
+	for _, st := range s.be.Status() {
+		state[st.Name] = st.State
+		order = append(order, st.Name)
+	}
+	cols := []*statsColumn{{head: "NODE"}, {head: "PATH"}, {head: "ALT", prio: 2}, {head: "STATE", prio: 1}}
+	var states []node.State
+	addRow := func(name, path, alt string, st node.State) {
+		for i, c := range []string{name, path, alt, st.String()} {
+			cols[i].cells = append(cols[i].cells, c)
+		}
+		states = append(states, st)
+	}
+	for _, n := range order {
+		addRow(n, "direct", "", state[n])
+	}
+	var def *node.RouteStatus
+	for _, r := range s.be.Routes() {
+		if r.Default {
+			rr := r
+			def = &rr
+			continue
+		}
+		used := r.Using
+		if used == "" {
+			used = r.Via // none up: show the via link's state
+		}
+		addRow(r.Dest, "via "+r.Via, r.Alt, state[used])
+	}
+	if def != nil {
+		addRow("*", "default via "+def.Via, "", state[def.Via])
+	}
+	if len(states) == 0 {
+		return []Line{{Text: "no links or routes", Color: Dim}}
+	}
+	return renderTable(cols, s.width, func(row int, col *statsColumn) Color {
+		switch col.head {
+		case "NODE":
+			if col.cells[row] == "*" {
+				return BoldYellow
+			}
+			return BoldCyan
+		case "STATE":
+			return stateColor(states[row])
+		}
+		return Default
+	})
 }

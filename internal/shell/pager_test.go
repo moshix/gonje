@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -27,8 +29,9 @@ func TestPagerPageBreaks(t *testing.T) {
 			s.Render(rows, 100)
 			h := s.pageRows()
 			s.showResult(numbered(100), 1)
-			if !s.Paging() || lastResult(s) != fmt.Sprintf("line %03d", h-1) {
-				t.Fatalf("rows %d split %v: first page ends at %q, want line %03d", rows, split, lastResult(s), h-1)
+			first := max(h-1, 1) // the echo line uses one row; at least one line
+			if !s.Paging() || lastResult(s) != fmt.Sprintf("line %03d", first) {
+				t.Fatalf("rows %d split %v: first page ends at %q, want line %03d", rows, split, lastResult(s), first)
 			}
 			if pl := s.pagerLine().Text; !strings.HasPrefix(pl, "-- more (") || !strings.HasSuffix(pl, "-- C continue, Q quit --") {
 				t.Fatalf("pager prompt %q", pl)
@@ -39,7 +42,7 @@ func TestPagerPageBreaks(t *testing.T) {
 				t.Fatalf("prompt row %q", f.Rows[f.CursorRow].Text)
 			}
 			s.PagerKey('c')
-			if lastResult(s) != fmt.Sprintf("line %03d", 2*h-1) {
+			if lastResult(s) != fmt.Sprintf("line %03d", first+h) {
 				t.Fatalf("second page ends at %q", lastResult(s))
 			}
 			for s.Paging() {
@@ -55,8 +58,8 @@ func TestPagerPageBreaks(t *testing.T) {
 func TestPagerQuitAndShortOutput(t *testing.T) {
 	s, _ := newTestShell(t)
 	s.Render(20, 100)
-	s.showResult(numbered(5), 1) // fits: no paging
-	if s.Paging() || lastResult(s) != "line 005" {
+	s.showResult(numbered(3), 1) // fits: no paging
+	if s.Paging() || lastResult(s) != "line 003" {
 		t.Fatal("short output paged")
 	}
 	s.showResult(numbered(100), 1)
@@ -103,7 +106,7 @@ func TestPagerHoldsEvents(t *testing.T) {
 	s.split = false
 	s.Render(20, 100)
 	s.showResult(numbered(100), 1)
-	s.HandleEvent(ev(link.EvMsgIn, 2, "during paging"))
+	s.HandleEvent(ev(link.EvLink, 2, "during paging"))
 	for _, l := range s.mixed.lines {
 		if strings.Contains(l.Text, "during paging") {
 			t.Fatal("event interleaved with paged output")
@@ -115,7 +118,7 @@ func TestPagerHoldsEvents(t *testing.T) {
 	}
 	s.split = true
 	s.showResult(numbered(100), 1)
-	s.HandleEvent(ev(link.EvMsgIn, 2, "split event"))
+	s.HandleEvent(ev(link.EvLink, 2, "split event"))
 	if !strings.Contains(s.events.lines[len(s.events.lines)-1].Text, "split event") {
 		t.Fatal("split view event held")
 	}

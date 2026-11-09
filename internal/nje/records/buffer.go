@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package records builds and parses NJE transmission buffers and the
 // records they carry: signon/signoff (NCCR I/J/B), job header (NJH),
 // data set header (NDH), job trailer (NJT) and nodal messages (NMR).

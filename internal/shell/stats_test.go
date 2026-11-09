@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -5,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"gonje/internal/config"
 	"gonje/internal/node"
 )
 
@@ -118,5 +121,80 @@ func TestCmdHintAndPendingTitle(t *testing.T) {
 	be.local.Pending = 2
 	if f := s.Render(24, 120); !strings.Contains(f.Rows[0].Text, "2 cmd pending") {
 		t.Fatalf("title %q", f.Rows[0].Text)
+	}
+}
+
+func TestLocalTimeoutAndStreamsOptions(t *testing.T) {
+	s, be := newTestShell(t)
+	s.set.ConfigPath = copyConfig(t)
+	if r := s.Exec("local timeout 300 save"); be.local.Timeout != 300 || !strings.Contains(joinText(r.Lines), "saved") {
+		t.Fatalf("%+v", r.Lines)
+	}
+	if c, _ := config.Load(s.set.ConfigPath); c.Timeout != 300 {
+		t.Fatal("timeout not saved")
+	}
+	if r := s.Exec("local timeout -5"); r.Lines[0].Color != Red {
+		t.Fatal("bad timeout accepted")
+	}
+	s.Exec("link define nodec 10.0.0.3 max-streams=3")
+	if be.remotes["NODEC"].MaxStreams != 3 {
+		t.Fatalf("%+v", be.remotes["NODEC"])
+	}
+	s.Exec("link change nodec max_streams=5")
+	if be.remotes["NODEC"].MaxStreams != 5 {
+		t.Fatal("max_streams change")
+	}
+	for _, bad := range []string{"link change nodec max_streams=9", "link change nodec eof_wait=5"} {
+		if r := s.Exec(bad); r.Lines[0].Color != Red {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestRouteCommands(t *testing.T) {
+	s, be := newTestShell(t)
+	s.set.ConfigPath = copyConfig(t)
+	r := s.Exec("ROUTE MVSF TO MVSB ALT MVSC")
+	if be.lastRoute != (config.Route{Dest: "MVSF", Via: "MVSB", Alt: "MVSC"}) || r.Lines[0].Text != "route to MVSF via MVSB (alt MVSC)" {
+		t.Fatalf("%+v %+v", be.lastRoute, r.Lines)
+	}
+	s.Exec("route far to nodeb save")
+	if c, err := config.Load(s.set.ConfigPath); err != nil || len(c.Routes) != 1 || c.Routes[0] != (config.Route{Dest: "FAR", Via: "NODEB"}) {
+		t.Fatalf("saved routes %v", err)
+	}
+	s.Exec("route default nodeb save")
+	if c, _ := config.Load(s.set.ConfigPath); c.DefaultRoute != "NODEB" {
+		t.Fatal("default route not saved")
+	}
+	s.Exec("route default delete save")
+	s.Exec("route delete far save")
+	if c, _ := config.Load(s.set.ConfigPath); c.DefaultRoute != "" || len(c.Routes) != 0 {
+		t.Fatal("route deletes not saved")
+	}
+	if !strings.Contains(be.calls[len(be.calls)-1], "route delete FAR") {
+		t.Fatalf("%q", be.calls)
+	}
+	for _, bad := range []string{"route", "route x to", "route x via y", "route x to y alt", "route x to y or z", "route TOOLONGNAME to b"} {
+		if r := s.Exec(bad); r.Lines[0].Color != Red {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	lines := s.Exec("route list").Lines
+	list := joinText(lines)
+	for _, want := range []string{"NODE", "PATH", "ALT", "STATE", "NODEB", "direct", "NODEC", "MVSF", "via MVSB", "MVSC",
+		"default via MVSB"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("routes table lacks %q:\n%s", want, list)
+		}
+	}
+	// One row per remote (2) and route (1), plus the default row.
+	if len(lines) != 1+2+1+1 || !strings.HasPrefix(strings.TrimSpace(lines[4].Text), "*") {
+		t.Fatalf("rows:\n%s", list)
+	}
+	if lines[1].Segs[4].Color != BoldGreen || lines[2].Segs[4].Color != Red {
+		t.Fatalf("state colors %+v", lines[1].Segs)
+	}
+	if joinText(s.Exec("routes").Lines) != list {
+		t.Fatal("routes alias")
 	}
 }

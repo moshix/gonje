@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package records
 
 import "testing"

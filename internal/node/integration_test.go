@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package node
 
 import (
@@ -37,7 +39,8 @@ func newTestNode(t *testing.T, name, peer, user string, keepalive int) *testNode
 	n := New(cfg, Options{RetryMin: 200 * time.Millisecond, RetryMax: time.Second,
 		NAKMin: 50 * time.Millisecond, NAKMax: 200 * time.Millisecond,
 		Handshake: 3 * time.Second, StartJitter: 50 * time.Millisecond, User: user,
-		Log: logx.New(logBuf, logx.Debug)})
+		StreamSettle: 10 * time.Millisecond,
+		Log:          logx.New(logBuf, logx.Debug)})
 	if err := n.Listen(); err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +231,9 @@ func TestIntegrationTwoNodes(t *testing.T) {
 	a.wait(t, "A link up again", 10*time.Second, kindText(link.EvLink, "link up"))
 	a.waitUp(t, "NODEB")
 	b.waitUp(t, "NODEA")
-	if err := b.SendMessage("NODEA", "*", "after reconnect"); err != nil {
+	// (To another user: within 5 minutes of A's commands, a message to
+	// ALICE or to the operator would count as a command response.)
+	if err := b.SendMessage("NODEA", "OTHER", "after reconnect"); err != nil {
 		t.Fatal(err)
 	}
 	a.wait(t, "message after reconnect", 5*time.Second, kindText(link.EvMsgIn, "after reconnect"))
@@ -357,6 +362,7 @@ func TestCollisionLowerCallerGetsNAK03(t *testing.T) {
 	defer b.Stop()
 	b.mu.Lock()
 	b.remotes["NODEA"].state = Connecting // NODEB is dialling NODEA itself
+	b.remotes["NODEA"].dialStart = time.Now()
 	b.mu.Unlock()
 	c, err := net.Dial("tcp", b.Addr().String())
 	if err != nil {

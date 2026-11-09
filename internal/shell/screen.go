@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package shell is gonje's operator interface: a classic line-mode
 // console and a split view (input/results on top, live events below).
 //
@@ -10,6 +12,7 @@ package shell
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -35,6 +38,9 @@ const (
 	BoldGreen
 	BoldRed
 	BoldYellow
+	BrightWhite
+	Blink    // SGR 5 blink (many terminals ignore it) ...
+	BlinkRev // ... so we also toggle reverse video ourselves
 )
 
 // ansi returns the SGR sequence for a color.
@@ -64,6 +70,12 @@ func (c Color) ansi() string {
 		return "\x1b[1;31m"
 	case BoldYellow:
 		return "\x1b[1;33m"
+	case BrightWhite:
+		return "\x1b[1;97m"
+	case Blink:
+		return "\x1b[5m"
+	case BlinkRev:
+		return "\x1b[5;7m"
 	}
 	return ""
 }
@@ -79,6 +91,9 @@ type Line struct {
 	Color Color
 	Cont  string
 	Segs  []Seg
+	// BlinkUntil: the tag segment (Segs[1], "MSG"/"RSP") blinks until
+	// then. Screen only; the log never sees it.
+	BlinkUntil time.Time
 }
 
 // Seg is a colored piece of a Line.

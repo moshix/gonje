@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Command gonje is an NJE-over-TCP/IP node with an operator shell.
 //
 //	gonje [-c|-f gonje.cnf] [-split=true|false] [-log gonje.log]
@@ -24,7 +26,7 @@ import (
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.4"
+var version = "0.6"
 
 func main() {
 	node.Version = version
@@ -101,6 +103,8 @@ func run() int {
 		Level:       cfg.PanelLevel,
 		Split:       cfg.SplitView,
 		SplitRatio:  cfg.SplitRatio,
+		MsgPane:     cfg.MsgPane,
+		MsgBell:     cfg.MsgBell,
 		HistoryPath: shell.DefaultHistoryPath(),
 		Log:         log,
 	})

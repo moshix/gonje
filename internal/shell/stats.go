@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -151,6 +153,26 @@ func (s *Shell) statsTable(c node.Counters, width int) []Line {
 			col.cells = append(col.cells, cells[i])
 		}
 	}
+	return renderTable(cols, width, func(li int, col *statsColumn) Color {
+		switch col.head {
+		case "NODE":
+			return BoldCyan
+		case "STATE":
+			return stateColor(c.Links[li].State)
+		case "ERR":
+			if col.cells[li] != "0" {
+				return Red
+			}
+		}
+		return Default
+	})
+}
+
+// renderTable lays out columns (cells per row) for a pane of width
+// columns (0 = no limit): header in bold, columns padded to a common
+// width, and low-priority columns dropped (highest prio number, rightmost
+// first) until the table fits; prio 0 columns always stay.
+func renderTable(cols []*statsColumn, width int, colorFor func(row int, col *statsColumn) Color) []Line {
 	colWidth := func(col *statsColumn) int {
 		w := Width(col.head)
 		for _, c := range col.cells {
@@ -168,8 +190,6 @@ func (s *Shell) statsTable(c node.Counters, width int) []Line {
 		}
 		return t
 	}
-	// Drop the highest-priority-number column (rightmost first) until
-	// the table fits; NODE and STATE (prio 0) always stay.
 	for width > 0 && total(cols) > width {
 		drop := -1
 		for i, col := range cols {
@@ -182,32 +202,24 @@ func (s *Shell) statsTable(c node.Counters, width int) []Line {
 		}
 		cols = append(cols[:drop], cols[drop+1:]...)
 	}
-	row := func(get func(*statsColumn) string, color func(i int, col *statsColumn) Color) Line {
+	row := func(get func(*statsColumn) string, color func(col *statsColumn) Color) Line {
 		segs := []Seg{{"  ", Default}}
 		for i, col := range cols {
 			text := get(col)
 			if i < len(cols)-1 {
 				text += strings.Repeat(" ", colWidth(col)-Width(text)+2)
 			}
-			segs = append(segs, Seg{text, color(i, col)})
+			segs = append(segs, Seg{text, color(col)})
 		}
 		return SegLine(segs...)
 	}
-	out := []Line{row(func(c *statsColumn) string { return c.head }, func(int, *statsColumn) Color { return Bold })}
-	for li := range c.Links {
-		out = append(out, row(func(col *statsColumn) string { return col.cells[li] }, func(i int, col *statsColumn) Color {
-			switch col.head {
-			case "NODE":
-				return BoldCyan
-			case "STATE":
-				return stateColor(c.Links[li].State)
-			case "ERR":
-				if col.cells[li] != "0" {
-					return Red
-				}
-			}
-			return Default
-		}))
+	out := []Line{row(func(c *statsColumn) string { return c.head }, func(*statsColumn) Color { return Bold })}
+	if len(cols) == 0 {
+		return out
+	}
+	for r := range cols[0].cells {
+		out = append(out, row(func(col *statsColumn) string { return col.cells[r] },
+			func(col *statsColumn) Color { return colorFor(r, col) }))
 	}
 	return out
 }
@@ -244,6 +256,8 @@ func (s *Shell) linkStats(l node.LinkCounters) []Line {
 		kv("address", addr, Default),
 		kv("session uptime", session, Default),
 		kv("connected total", fmtDur(l.Connected), Default),
+		kv("buffer size", bufText(l.BufSize, x.PeerBufSize), Default),
+		kv("max streams", fmt.Sprintf("%d (active in/out %d/%d)", l.MaxStreams, x.ActiveIn, x.ActiveOut), Default),
 		kv("connects/failures", io2(l.Connects, l.Failures), Default),
 		kv("last error", lastErr, Dim),
 		kv("blocks in/out", io2(x.BlocksIn, x.BlocksOut), Default),
@@ -259,4 +273,13 @@ func (s *Shell) linkStats(l node.LinkCounters) []Line {
 		kv("last activity", last, Default),
 		kv("idle reply delay", x.IdleDelay.String(), Default),
 	}
+}
+
+// bufText shows our buffer size and, when signed on, the peer's and the
+// size we actually send (the smaller one).
+func bufText(ours, peer int) string {
+	if peer == 0 {
+		return fmt.Sprintf("%d", ours)
+	}
+	return fmt.Sprintf("%d (peer %d, sending up to %d)", ours, peer, min(ours, peer))
 }

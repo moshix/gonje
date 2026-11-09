@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package config parses gonje.cnf.
 //
 // Format: key=value tokens separated by newlines, spaces or commas. A
@@ -19,28 +21,34 @@ import (
 
 // Remote is one remote NJE node definition.
 type Remote struct {
-	Name      string // NJE node name, 1-8 chars, upper case
-	Addr      string // host name or IP; empty = passive (accept only)
-	Port      int    // TCP port, default 175
-	Keepalive int    // seconds, default 10
-	Password  string // optional node password, upper case
-	StrictBCB bool   // manual BCB rules (E0 + terminate) instead of resync
-	Turn      string // "free" (default: send any time) or "strict" (BSC alternation)
-	EOFWait   int    // seconds to wait for C0 after EOF (0 = default 10)
+	Name       string // NJE node name, 1-8 chars, upper case
+	Addr       string // host name or IP; empty = passive (accept only)
+	Port       int    // TCP port, default 175
+	Keepalive  int    // seconds, default 10
+	Password   string // optional node password, upper case
+	StrictBCB  bool   // manual BCB rules (E0 + terminate) instead of resync
+	Turn       string // "free" (default: send any time) or "strict" (BSC alternation)
+	MaxStreams int    // concurrent SYSIN/SYSOUT streams, 1-8 (0 = default 1)
+	BufSize    int    // NJE buffer size we advertise (0 = default 8192)
 }
 
 // Config is the whole gonje configuration.
 type Config struct {
-	LocalNode  string
-	LocalIP    string
-	LocalPort  int
-	SendDir    string
-	RecvDir    string
-	LogLevel   string
-	SplitView  bool
-	SplitRatio int
-	PanelLevel int
-	Remotes    []*Remote
+	LocalNode    string
+	LocalIP      string
+	LocalPort    int
+	SendDir      string
+	RecvDir      string
+	LogLevel     string
+	SplitView    bool
+	SplitRatio   int
+	PanelLevel   int
+	Timeout      int  // seconds to keep retrying an unreachable remote (0 = forever)
+	MsgPane      int  // messages pane rows (default 6, 3-50)
+	MsgBell      bool // terminal bell on incoming messages
+	Remotes      []*Remote
+	Routes       []Route // route=<dest>,<via>[,<alt>]
+	DefaultRoute string  // default_route=<node>: anything else goes there
 
 	// Warnings collects non-fatal problems (unknown keys, ...) for the
 	// caller to log once the log file is open.
@@ -57,6 +65,7 @@ func Defaults() *Config {
 		LogLevel:   "debug",
 		SplitView:  true,
 		SplitRatio: 40,
+		MsgPane:    6,
 		PanelLevel: 1,
 	}
 }
@@ -92,14 +101,25 @@ func tokenize(r io.Reader) ([]token, error) {
 				break // comment to end of line
 			}
 			k, v, ok := strings.Cut(f, "=")
+			if !ok && len(toks) > 0 && toks[len(toks)-1].key == "route" && toks[len(toks)-1].line == ln {
+				// route=<dest>,<via>[,<alt>]: the commas split it into
+				// several fields; glue them back into one value.
+				toks[len(toks)-1].val += "," + f
+				continue
+			}
 			if !ok || k == "" {
 				return nil, fmt.Errorf("line %d: expected key=value, got %q", ln, f)
 			}
-			toks = append(toks, token{strings.ToLower(k), v, ln})
+			// Keys are case-insensitive and '-' is accepted for '_'
+			// (e.g. remote_max-streams).
+			toks = append(toks, token{normKey(k), v, ln})
 		}
 	}
 	return toks, sc.Err()
 }
+
+// normKey lower-cases a key and accepts '-' for '_'.
+func normKey(k string) string { return strings.ReplaceAll(strings.ToLower(k), "-", "_") }
 
 // Parse parses config text and validates the result.
 func Parse(r io.Reader) (*Config, error) {
@@ -153,6 +173,36 @@ func Parse(r io.Reader) (*Config, error) {
 				return nil, bad(err)
 			}
 			c.SplitRatio = n
+		case "msg_pane":
+			n, err := intRange(t.val, 3, 50)
+			if err != nil {
+				return nil, bad(err)
+			}
+			c.MsgPane = n
+		case "msg_bell":
+			b, err := boolean(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			c.MsgBell = b
+		case "route":
+			r, err := ParseRoute(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			c.Routes = append(c.Routes, r)
+		case "default_route":
+			n, err := NodeName(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			c.DefaultRoute = n
+		case "timeout":
+			n, err := Timeout(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			c.Timeout = n
 		case "panel_level":
 			n, err := intRange(t.val, 1, 3)
 			if err != nil {
@@ -180,12 +230,18 @@ func Parse(r io.Reader) (*Config, error) {
 				return nil, bad(err)
 			}
 			cur.Keepalive = n
-		case "remote_eof_wait":
-			n, err := intRange(t.val, 1, 3600)
+		case "remote_buffersize":
+			n, err := BufSize(t.val)
 			if err != nil {
 				return nil, bad(err)
 			}
-			cur.EOFWait = n
+			cur.BufSize = n
+		case "remote_max_streams":
+			n, err := MaxStreams(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			cur.MaxStreams = n
 		case "remote_turn":
 			v := strings.ToLower(t.val)
 			if v != "free" && v != "strict" {
@@ -229,6 +285,72 @@ func (c *Config) validate() error {
 		}
 		seen[r.Name] = true
 	}
+	dests := map[string]bool{}
+	for _, r := range c.Routes {
+		if err := ValidateRoute(r, c); err != nil {
+			return err
+		}
+		if dests[r.Dest] {
+			return fmt.Errorf("route to %s defined twice", r.Dest)
+		}
+		dests[r.Dest] = true
+	}
+	if c.DefaultRoute != "" && c.Remote(c.DefaultRoute) == nil {
+		return fmt.Errorf("default_route %s is not a configured remote node", c.DefaultRoute)
+	}
+	return nil
+}
+
+// Route sends traffic for node Dest through the directly linked node
+// Via, or Alt when Via's link is not up.
+type Route struct {
+	Dest, Via, Alt string
+}
+
+// String is the config form "<dest>,<via>[,<alt>]".
+func (r Route) String() string {
+	s := r.Dest + "," + r.Via
+	if r.Alt != "" {
+		s += "," + r.Alt
+	}
+	return s
+}
+
+// ParseRoute parses "<dest>,<via>[,<alt>]" (names only, see ValidateRoute).
+func ParseRoute(v string) (Route, error) {
+	p := strings.Split(v, ",")
+	if len(p) < 2 || len(p) > 3 {
+		return Route{}, fmt.Errorf("route must be <dest>,<via>[,<alt>]")
+	}
+	var r Route
+	var err error
+	if r.Dest, err = NodeName(p[0]); err != nil {
+		return r, err
+	}
+	if r.Via, err = NodeName(p[1]); err != nil {
+		return r, err
+	}
+	if len(p) == 3 {
+		if r.Alt, err = NodeName(p[2]); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
+}
+
+// ValidateRoute checks a route against the configuration: via and alt
+// must be defined links; dest can be neither us nor the via node.
+func ValidateRoute(r Route, c *Config) error {
+	switch {
+	case r.Dest == c.LocalNode:
+		return fmt.Errorf("route to %s: that is the local node", r.Dest)
+	case r.Dest == r.Via || r.Dest == r.Alt:
+		return fmt.Errorf("route to %s cannot go via itself", r.Dest)
+	case c.Remote(r.Via) == nil:
+		return fmt.Errorf("route to %s: via %s is not a configured remote node", r.Dest, r.Via)
+	case r.Alt != "" && c.Remote(r.Alt) == nil:
+		return fmt.Errorf("route to %s: alt %s is not a configured remote node", r.Dest, r.Alt)
+	}
 	return nil
 }
 
@@ -263,6 +385,28 @@ func port(s string) (int, error) { return intRange(s, 1, 65535) }
 
 // Port validates a TCP port number (1-65535).
 func Port(s string) (int, error) { return port(s) }
+
+// MaxStreams validates a stream count: 1-8 (the FCS has bits for 8
+// shared SYSIN/SYSOUT streams).
+func MaxStreams(s string) (int, error) {
+	n, err := intRange(s, 1, 8)
+	if err != nil {
+		return 0, fmt.Errorf("max_streams: %v", err)
+	}
+	return n, nil
+}
+
+// Timeout validates the general connect timeout in seconds (0 = never).
+func Timeout(s string) (int, error) { return intRange(s, 0, 86400) }
+
+// BufSize validates an NJE buffer size (the manual's range 300-32768).
+func BufSize(s string) (int, error) {
+	n, err := intRange(s, 300, 32768)
+	if err != nil {
+		return 0, fmt.Errorf("buffersize: %v", err)
+	}
+	return n, nil
+}
 
 // Keepalive validates a keepalive interval in seconds (1-3600).
 func Keepalive(s string) (int, error) { return intRange(s, 1, 3600) }
@@ -306,8 +450,11 @@ func ValidateRemote(r *Remote, local string) error {
 		return err
 	}
 	r.Password = pw
-	if r.EOFWait < 0 || r.EOFWait > 3600 {
-		return fmt.Errorf("eof_wait %d out of range 1-3600", r.EOFWait)
+	if r.BufSize != 0 && (r.BufSize < 300 || r.BufSize > 32768) {
+		return fmt.Errorf("buffersize %d out of range 300-32768", r.BufSize)
+	}
+	if r.MaxStreams < 0 || r.MaxStreams > 8 {
+		return fmt.Errorf("max_streams %d out of range 1-8", r.MaxStreams)
 	}
 	switch r.Turn = strings.ToLower(r.Turn); r.Turn {
 	case "", "free", "strict":

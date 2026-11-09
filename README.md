@@ -43,13 +43,19 @@ A word starting with `#` starts a comment (a `#` inside a value is kept).
 | `split_view` | yes/no: start in split view (default yes) |
 | `split_ratio` | event panel height in percent (default 40) |
 | `panel_level` | 1, 2 or 3 (see below) |
+| `msg_pane` | height of the messages pane (default 6, 3-50) |
+| `msg_bell` | yes = ring the terminal bell on incoming messages |
+| `route` | `route=<dest>,<via>[,<alt>]`: reach a node through a directly linked one (alt when via is down); one line per route |
+| `default_route` | `default_route=<node>`: every other unknown node is sent there (must be a defined remote) |
+| `timeout` | stop retrying a remote that could not be reached for this many seconds (0 = never; `connect` starts again) |
 | `remote_host_name` | starts a remote node block |
 | `remote_host_addr` | its host or IP; leave out to only accept calls |
 | `remote_host_port` | its port (default 175) |
 | `remote_keepalive` | seconds without any block from the peer before a null buffer restarts the exchange; 3x this = link dead (default 10) |
 | `remote_password` | optional node password (never written to the log) |
 | `remote_turn` | free (default): send whenever there is data, dead links found by TCP keepalive; strict: BSC-style turn-taking, dead after 3x keepalive of silence |
-| `remote_eof_wait` | seconds to wait for the peer to confirm a sent file (default 10); without confirmation the file counts as sent |
+| `remote_buffersize` | NJE buffer size we offer, 300-32768 (default 8192); we send at most the smaller of ours and the peer's |
+| `remote_max_streams` | concurrent file transfers each way, 1-8 (default 1) |
 | `remote_strict_bcb` | yes = on a block sequence error send E0 and drop the link, as the manual says; no (default) = log it and resynchronise |
 
 Received files are named
@@ -69,7 +75,9 @@ files are sent as punch files (80-byte records).
 On a terminal gonje takes over the screen with framed panes (Unicode
 box drawing, or ASCII when the locale is not UTF-8 or `GONJE_ASCII=1`)
 and restores it on exit. Split view: commands and results on top,
-incoming events below. Single pane: both interleaved. Long output is
+incoming events below. Single pane: both interleaved. Incoming
+messages and command responses always have their own white-framed pane
+at the bottom. Long output is
 paged: `C`/Space/Enter for more, `Q`/Esc to stop. Colors follow
 `NO_COLOR`; piped (non-tty) use gives plain lines.
 
@@ -110,23 +118,33 @@ also works in interactive mode). The link is closed without signoff.
 | `msg <node> <user> <text>` | send a message (`*` = operator) |
 | `cmd <node> <command>` | send a command, e.g. `cmd NODEB Q SYS` |
 | `send <node> <user> <file>` | send a file |
+| `route <dest> to <via> [alt <alt>] [save]` | route a node through another link (`route delete`, `route default <node>\|delete`, `route list`) |
+| `spool [<#\|file> \| delete <#\|file>]` | received files with their NJE details |
 | `ls` / `inbox` | list send_dir / recv_dir |
-| `local [name\|ip\|port <value>] [save]` | show or change the local node |
+| `local [name\|ip\|port\|timeout <value>] [save]` | show or change the local node |
 | `stats [<node>\|reset [<node>]]` | traffic counters |
 | `level 1\|2\|3` | event detail |
-| `split on\|off\|<percent>` | split view, single pane, or events pane size |
+| `split on\|off\|<percent>\|msgs <n>` | split view, single pane, events or messages pane size |
 | `log` / `version` | end of the log / gonje version |
 | `quit` | close all links and exit (no signoff, so peers accept us straight back; `drop`/`drain` do sign off) |
 
-Link options: `port=<n> keepalive=<s> password=<pw> strict_bcb=yes|no turn=free|strict eof_wait=<s>`.
+Link options: `port=<n> keepalive=<s> password=<pw> strict_bcb=yes|no turn=free|strict buffersize=<n> max_streams=<n>`. A sent file the peer does not confirm within 10 s counts as sent.
 With `save` the change is also written to the config file (`-c`); other
 lines and comments are kept. Renaming the local node makes every active
 link sign off and reconnect with the new name.
 
+Routing: a direct link wins, then a `route`, then the `default_route`.
+gonje also forwards messages and files for other nodes (store-and-forward;
+origin kept, at most 16 hops, never back over the link they came in on).
+Each received file gets a `.meta` sidecar used by `spool`. Files sent with
+TSO/NJE38 TRANSMIT (NETDATA) are unpacked and named after the data set
+(e.g. `HOUCICS.HERC01.HERC01.SENDFILE.<time>.txt`); a PDS is kept as `.bin`.
+
 Incoming `Q SYS`, `Q LINKS` and `Q FILES` commands are answered
 automatically; other commands get "unsupported command".
 
-Keys: Tab moves the scroll focus between the panes, Ctrl-U/Ctrl-D
+Keys: Tab moves the scroll focus between the panes (commands, events,
+messages), Ctrl-U/Ctrl-D
 scroll the focused pane, Ctrl-G/Ctrl-V (or Ctrl-Up/Ctrl-Down) resize the
 events pane, Ctrl-L redraws. Line editing: Up/Down or Ctrl-P/Ctrl-N
 history (saved in `~/.gonje_history`), Ctrl-R search history,
@@ -160,3 +178,8 @@ Then, in node A's shell:
 
 Node B shows the message, the command and the file, which lands in
 `test/nodeB/inbox/`. Try `drop nodeb` and `connect nodeb` too.
+
+## License
+
+gonje is free software, licensed under the GNU General Public License
+version 2 (GPL-2.0). See [LICENSE](LICENSE).

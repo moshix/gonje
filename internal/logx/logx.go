@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package logx is gonje's file logger. Every protocol event, raw TTB/TTR
 // block and decoded record ends up here (see PLAN: "gonje.log always gets
 // full L3 detail plus raw TTB/TTR block dumps").

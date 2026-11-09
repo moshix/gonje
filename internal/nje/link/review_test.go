@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package link
 
 import (
@@ -429,7 +431,7 @@ func TestFreeModeSilentPeer(t *testing.T) {
 		rec, _ := p.readOne(time.Second)
 		if b, err := records.Decode(rec); err == nil {
 			for _, r := range b.Records {
-				if r.RCB == 0x99 && r.SRCB == records.SRCBEOF {
+				if r.RCB == 0x99 && isEOF(r) {
 					sawEOF = true
 				}
 			}
@@ -452,5 +454,223 @@ func TestFreeModeSilentPeer(t *testing.T) {
 	}
 	if nulls < 3 || nulls > 12 {
 		t.Fatalf("%d keepalive nulls in 1.5 s with keepalive 200ms", nulls)
+	}
+}
+
+// TestNoEOFAck: like HOUCICS, the peer takes the file but never sends C0.
+// After EOFWait the file counts as sent (unconfirmed), the next file
+// starts, and a late C0 is ignored.
+func TestNoEOFAck(t *testing.T) {
+	s, p, h, errs := acceptRawP(t, 5*time.Second, func(pp *Params) { pp.EOFWait = 300 * time.Millisecond })
+	signonRaw(t, p, errs)
+	go s.Run()
+	defer s.Kill()
+	h.enqueue(&OutboundFile{Name: "one", ToNode: "RAW", ToUser: "U", Records: [][]byte{{0xC1}}})
+	h.enqueue(&OutboundFile{Name: "two", ToNode: "RAW", ToUser: "U", Records: [][]byte{{0xC2}}})
+	s.Kick()
+	if b := p.readBuf(); b.Records[0].RCB != records.RCBRequest {
+		t.Fatal("expected request")
+	}
+	p.sendBuf(records.FCSNormal, records.Record{RCB: records.RCBPermit, SRCB: 0x99})
+	for eof := false; !eof; {
+		for _, r := range p.readBuf().Records {
+			eof = eof || (r.RCB == 0x99 && isEOF(r))
+		}
+	}
+	start := time.Now()
+	// No C0. The second file's request must follow after EOFWait.
+	if b := p.readBuf(); b.Records[0].RCB != records.RCBRequest {
+		t.Fatalf("expected the next request, got %s", b.Records[0].Describe())
+	}
+	if d := time.Since(start); d < 250*time.Millisecond {
+		t.Fatalf("gave up waiting for C0 after only %v", d)
+	}
+	h.mu.Lock()
+	if len(h.done) != 1 || h.done[0] != nil || len(h.queue) != 1 {
+		t.Fatalf("done %v queue %d", h.done, len(h.queue))
+	}
+	unconfirmed := false
+	for _, e := range h.events {
+		unconfirmed = unconfirmed || (e.Kind == EvFileOut && strings.Contains(e.Text, "one sent to RAW/U (peer did not confirm receipt)"))
+	}
+	h.mu.Unlock()
+	if !unconfirmed || s.Stats().FilesOut != 1 {
+		t.Fatal("unconfirmed file not reported/counted")
+	}
+	// A late C0 while the next request waits: ignored, nothing breaks.
+	p.sendBuf(records.FCSNormal, records.Record{RCB: records.RCBAckEOF, SRCB: 0x99})
+	time.Sleep(100 * time.Millisecond)
+	if len(h.done) != 1 {
+		t.Fatal("late C0 completed a file")
+	}
+}
+
+// TestConfiguredBufferSize: our I and J carry the configured size (J
+// capped at the peer's), and we send at most min(ours, peer's).
+func TestConfiguredBufferSize(t *testing.T) {
+	// We are secondary: peer offers 4000, we are configured for 2000.
+	s, p, _, errs := acceptRawP(t, 5*time.Second, func(pp *Params) { pp.BufSize = 2000 })
+	p.send(records.SOHENQ)
+	p.read()
+	p.sendBuf(records.FCSNormal, (&records.Signon{SRCB: records.SRCBSignonI, Node: "RAW", BufSize: 4000}).Record())
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	j, _ := records.ParseSignon(p.readBuf().Records[0])
+	if j.BufSize != 2000 || s.bufLimit != 2000-bufMargin {
+		t.Fatalf("J %d, limit %d", j.BufSize, s.bufLimit)
+	}
+	s.Kill()
+	// Peer offers less (1012): J says 1012, the send limit follows it.
+	s, p, _, errs = acceptRawP(t, 5*time.Second, func(pp *Params) { pp.BufSize = 2000 })
+	p.send(records.SOHENQ)
+	p.read()
+	p.sendBuf(records.FCSNormal, (&records.Signon{SRCB: records.SRCBSignonI, Node: "RAW", BufSize: 1012}).Record())
+	<-errs
+	j, _ = records.ParseSignon(p.readBuf().Records[0])
+	if j.BufSize != 1012 || s.bufLimit != 1012-bufMargin {
+		t.Fatalf("J %d, limit %d", j.BufSize, s.bufLimit)
+	}
+	s.Kill()
+	// Our I carries the configured size.
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	got := make(chan uint16, 1)
+	go func() {
+		c, _ := ln.Accept()
+		defer c.Close()
+		rp := &rawPeer{t: t, c: c, br: bufio.NewReader(c)}
+		rp.read() // SOH ENQ
+		rp.send(records.DLEACK0)
+		i, _ := records.ParseSignon(rp.readBuf().Records[0])
+		got <- i.BufSize
+	}()
+	c, _ := net.Dial("tcp", ln.Addr().String())
+	defer c.Close()
+	ps := New(c, Params{Local: "GONJE", Remote: "RAW", BufSize: 3000, Handler: newHandler(), Handshake: time.Second})
+	go ps.SignonPrimary()
+	if n := <-got; n != 3000 {
+		t.Fatalf("I offers %d", n)
+	}
+}
+
+// TestInboundStreamLimit: with max_streams=2 a third concurrent request
+// is refused (the sender keeps the file); when a stream frees up we send
+// D0 so the sender asks again. Our FCS only enables streams 1-2.
+func TestInboundStreamLimit(t *testing.T) {
+	s, p, _, errs := acceptRawP(t, 5*time.Second, func(pp *Params) { pp.MaxStreams = 2 })
+	signonRaw(t, p, errs)
+	go s.Run()
+	defer s.Kill()
+	want := func(rcb, srcb byte) *records.Buffer {
+		t.Helper()
+		b := p.readBuf()
+		if b.Records[0].RCB != rcb || b.Records[0].SRCB != srcb {
+			t.Fatalf("got %s %02X, want %02X %02X", b.Records[0].Describe(), b.Records[0].SRCB, rcb, srcb)
+		}
+		return b
+	}
+	p.sendBuf(records.FCSNormal, records.Record{RCB: 0x90, SRCB: 0x99})
+	want(records.RCBPermit, 0x99)
+	p.sendBuf(records.FCSNormal, records.Record{RCB: 0x90, SRCB: 0xA9})
+	want(records.RCBPermit, 0xA9)
+	p.sendBuf(records.FCSNormal, records.Record{RCB: 0x90, SRCB: 0xB9})
+	b := want(records.RCBDeny, 0xB9)
+	if b.FCS != (records.FCS{0x8F, 0xCF}) { // always all streams (NJE38 needs it)
+		t.Fatalf("FCS % X", b.FCS)
+	}
+	p.sendBuf(records.FCSNormal, records.Record{RCB: 0x99, SRCB: 0x00})
+	want(records.RCBAckEOF, 0x99)
+	want(records.RCBReady, 0x99)
+}
+
+func TestStreamFCS(t *testing.T) {
+	if streamFCS(1) != (records.FCS{0x8F, 0xCF}) || streamFCS(8) != (records.FCS{0x8F, 0xCF}) {
+		t.Fatalf("% X % X", streamFCS(1), streamFCS(8))
+	}
+}
+
+// TestStreamSettle: after signon no file request goes out until the
+// peer's first data block (HOUCICS sends its signon NMR ~3 s after J),
+// or until the settle time when the peer stays silent. NMRs go at once.
+func TestStreamSettle(t *testing.T) {
+	for _, peerTalks := range []bool{true, false} {
+		s, p, h, errs := acceptRawP(t, 5*time.Second, func(pp *Params) { pp.StreamSettle = 600 * time.Millisecond })
+		signonRaw(t, p, errs)
+		go s.Run()
+		h.enqueue(&OutboundFile{Name: "f", ToNode: "RAW", ToUser: "U", Records: [][]byte{{0xC1}}})
+		for _, m := range records.NewMessages("GONJE", "OPER", "RAW", "U", "EARLY") {
+			s.SendNMR(m)
+		}
+		s.Kick()
+		start := time.Now()
+		if b := p.readBuf(); b.Records[0].RCB != records.RCBNMR {
+			t.Fatalf("expected the NMR first, got %s", b.Records[0].Describe())
+		}
+		if peerTalks {
+			time.Sleep(200 * time.Millisecond)
+			p.sendBuf(records.FCSNormal, records.NewMessages("RAW", "SYS", "GONJE", "*", "SIGNON COMPLETE")[0].Record())
+		}
+		var req time.Duration
+		for req == 0 {
+			b := p.readBuf()
+			if b.Records[0].RCB == records.RCBRequest {
+				req = time.Since(start)
+			}
+		}
+		if peerTalks && (req < 180*time.Millisecond || req > 500*time.Millisecond) {
+			t.Fatalf("request %v after signon, want right after the peer's NMR (~200ms)", req)
+		}
+		if !peerTalks && req < 550*time.Millisecond {
+			t.Fatalf("request after only %v, before the settle time", req)
+		}
+		s.Kill()
+	}
+}
+
+// TestEOFIsEmptyDataRecord: our EOF must be RCB, SRCB X'80', SCB 00 (an
+// empty data record) as NJE38 sends and expects; SRCB X'00' made NJE38
+// raise NJE939E reason code 01 on HOUCICS. Both forms are accepted inbound.
+func TestEOFIsEmptyDataRecord(t *testing.T) {
+	b := &records.Buffer{BCB: 0x80, FCS: records.FCSNormal,
+		Records: []records.Record{{RCB: 0x99, SRCB: records.SRCBData}}}
+	wire := b.Encode()
+	want := []byte{0x99, 0x80, 0x00, 0x00} // record, SCB 00, end of block
+	if !bytes.Equal(wire[len(wire)-4:], want) {
+		t.Fatalf("EOF bytes % X, want ... % X", wire, want)
+	}
+	back, err := records.Decode(wire)
+	if err != nil || len(back.Records) != 1 || !isEOF(back.Records[0]) {
+		t.Fatalf("decoded EOF %+v err %v", back, err)
+	}
+	if !isEOF(records.Record{RCB: 0x99, SRCB: records.SRCBEOF}) {
+		t.Fatal("SRCB 00 EOF not accepted")
+	}
+	if isEOF(records.Record{RCB: 0x99, SRCB: records.SRCBData, Data: []byte{0x40}}) {
+		t.Fatal("a one-byte data record is not EOF")
+	}
+}
+
+// TestRecordLengthByte: unspanned data records carry a 1-byte length in
+// front (figs 20/21). Vector from the live NJE38 trace on 2026-11-09:
+// NJE38 sent "50" + 80 bytes. Records without the prefix are kept as is,
+// and a blank-truncated record is padded back to the LRECL.
+func TestRecordLengthByte(t *testing.T) {
+	var lb bytes.Buffer
+	s := &Session{log: logx.New(&lb, logx.Debug)}
+	st := &rxStream{rcb: 0x99}
+	rec := append([]byte{0x50}, bytes.Repeat([]byte{0xC1}, 80)...)
+	if got := s.stripRecordLength(st, rec); len(got) != 80 || got[0] != 0xC1 {
+		t.Fatalf("NJE38 record: got %d bytes", len(got))
+	}
+	// Truncated trailing blanks: length 80, only 3 bytes sent, LRECL 80.
+	st.cur = &InboundDataset{Header: &records.DatasetHeader{LRECL: 80}}
+	if got := s.stripRecordLength(st, []byte{0x50, 0xC1, 0xC2, 0xC3}); len(got) != 80 || got[79] != 0x40 {
+		t.Fatalf("truncated record: got %d bytes", len(got))
+	}
+	// No prefix ("Hello"): the first byte is not a length, keep it.
+	hello := []byte{0xC8, 0x85, 0x93, 0x93, 0x96}
+	if got := s.stripRecordLength(st, hello); !bytes.Equal(got, hello) {
+		t.Fatalf("unprefixed record changed: % X", got)
 	}
 }

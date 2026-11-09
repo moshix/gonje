@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package link
 
 import (
@@ -28,8 +30,17 @@ const (
 	// JES2 TCP/IP idle throttle (App. A). Real traffic resets it.
 	idleStep = 100 * time.Millisecond
 	idleMax  = time.Second
-	// DefaultEOFWait is how long we wait for C0 after sending EOF.
+	// DefaultEOFWait is how long we wait for C0 after sending EOF. Fixed,
+	// not configurable: HOUCICS/NJE38 never sends C0 at all, so after
+	// this grace the file counts as sent (unconfirmed).
 	DefaultEOFWait = 10 * time.Second
+	// streamSettle: after signon no file stream is started until the
+	// peer has sent its first data block or this time has passed.
+	// HOUCICS (NJE38) rejected a file started in the same millisecond as
+	// our J ("NJE939E Protocol error ... reason code 01", receive-test.log
+	// 11:20:39) and only sent its own post-signon NMR 3 s later; the same
+	// file sent later went through. NMRs are not held back.
+	streamSettle = 5 * time.Second
 	// DefaultMaxJob caps the bytes buffered for one inbound job (R2).
 	DefaultMaxJob = 256 << 20
 	// maxSpanned is the largest spanned logical record (spec 02 1B).
@@ -51,6 +62,12 @@ type Params struct {
 	Handshake time.Duration // timeout for each handshake step
 	StrictBCB bool          // manual BCB rules: E0 + terminate on mismatch
 	EOFWait   time.Duration // wait for C0 after our EOF (default 10 s)
+	// MaxStreams: concurrent SYSIN/SYSOUT transfers per direction (1-8;
+	// the FCS has 8 shared SYSIN/SYSOUT bits, spec 02 section 1.3).
+	MaxStreams int
+	// StreamSettle overrides the post-signon settle time (tests only;
+	// 0 = streamSettle).
+	StreamSettle time.Duration
 	// StrictTurn: BSC-style alternation (every block answered, sending
 	// only on our turn, dead after 3x keepalive of silence). Off (the
 	// default, remote_turn=free): send whenever we have data.
@@ -75,6 +92,12 @@ func (p *Params) defaults() {
 	}
 	if p.MaxJob == 0 {
 		p.MaxJob = DefaultMaxJob
+	}
+	if p.StreamSettle == 0 {
+		p.StreamSettle = streamSettle
+	}
+	if p.MaxStreams < 1 || p.MaxStreams > 8 {
+		p.MaxStreams = 1
 	}
 	if p.EOFWait == 0 {
 		p.EOFWait = DefaultEOFWait
@@ -107,7 +130,12 @@ type Session struct {
 	idleOut     int
 	lastSummary time.Time
 	ctlQueue    []records.Record // stream control replies (A0/B0/C0)
-	tx          txState
+	txs         []*txState       // outbound slots, one per stream (max_streams)
+	txTurn      int              // round-robin position among the slots
+	ourFCS      records.FCS
+	refusedFull bool      // we refused a request because all streams were busy
+	settled     bool      // peer sent data after signon, or streamSettle passed
+	signedOnAt  time.Time // when signon completed
 	rx          map[byte]*rxStream
 	draining    bool // graceful drop requested
 	peerDrained bool // the peer refused our request (B0 to 90) until D0
@@ -123,7 +151,7 @@ type Session struct {
 	inCh    chan []byte
 	errCh   chan error
 	kickCh  chan struct{}
-	drainCh chan bool
+	drainCh chan drainReq
 	closeCh chan closeReq
 	done    chan struct{}
 	quit    chan struct{}
@@ -136,7 +164,7 @@ type Session struct {
 // New wraps an established TCP connection (after OPEN/ACK).
 func New(conn net.Conn, p Params) *Session {
 	p.defaults()
-	return &Session{
+	s := &Session{
 		p:        p,
 		conn:     conn,
 		br:       bufio.NewReaderSize(conn, 70000),
@@ -147,12 +175,25 @@ func New(conn net.Conn, p Params) *Session {
 		inCh:     make(chan []byte, 256), // deep: keeps reading while Run is busy writing
 		errCh:    make(chan error, 1),
 		kickCh:   make(chan struct{}, 1),
-		drainCh:  make(chan bool, 4),
+		drainCh:  make(chan drainReq, 4),
 		closeCh:  make(chan closeReq, 1),
 		done:     make(chan struct{}),
 		quit:     make(chan struct{}),
 	}
+	s.initTx()
+	s.ourFCS = streamFCS(p.MaxStreams)
+	return s
 }
+
+// streamFCS is the FCS we send: always X'8FCF' (every SYSIN/SYSOUT
+// stream and the console enabled), whatever max_streams says. NJE38
+// (HOUCICS) rejected our file with "NJE939E Protocol error in file ...
+// reason code 01" when our FCS enabled stream 1 only (X'88C1',
+// live06.log 11:30:45) and accepted the identical file with X'8FCF'
+// (houcics-test5.log 10:53:03). max_streams is enforced by never
+// starting more than n outbound streams and by refusing the peer's
+// n+1th request (B0, then D0 when a stream frees up).
+func streamFCS(int) records.FCS { return records.FCSNormal }
 
 // Remote returns the peer node name.
 func (s *Session) Remote() string { return s.p.Remote }
@@ -296,7 +337,7 @@ func (s *Session) sendLine(seq []byte) error {
 // (null buffers included, spec 03 section 3). FCS is always "all streams
 // enabled": gonje never throttles its peer.
 func (s *Session) sendBuffer(recs []records.Record) error {
-	b := &records.Buffer{BCB: 0x80 | s.outSeq, FCS: records.FCSNormal, Records: recs}
+	b := &records.Buffer{BCB: 0x80 | s.outSeq, FCS: s.ourFCS, Records: recs}
 	s.outSeq = (s.outSeq + 1) & 0x0F
 	if len(recs) == 0 {
 		s.emit(EvKeepalive, L3, "keepalive ->")
@@ -521,6 +562,7 @@ func (s *Session) finishSignon(peer *records.Signon, primary bool) {
 	s.bufLimit = limit - bufMargin
 	now := time.Now()
 	s.lastRecv = now
+	s.signedOnAt = now
 	s.count(func(st *Stats) {
 		st.Primary, st.Since, st.PeerBufSize = primary, now, int(peer.BufSize)
 	})

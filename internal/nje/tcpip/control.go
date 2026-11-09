@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package tcpip implements the NJE-over-TCP/IP transport layer
 // (SA32-0988 Chapter 12, docs/spec/01_intro_tcpip.md section 3):
 // the 33-byte OPEN/ACK/NAK control records exchanged right after the TCP

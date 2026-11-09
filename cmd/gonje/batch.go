@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package main
 
 import (
@@ -191,6 +193,10 @@ func runBatch(j *batchJob, cfg *config.Config, log *logx.Logger, out io.Writer, 
 	b := &batch{j: j, out: out, log: log}
 	if cfg.Remote(j.node) == nil {
 		return b.fail(fmt.Sprintf("no remote node %s in the configuration", j.node))
+	}
+	// The general "timeout" shortens the signon window if it is smaller.
+	if t := time.Duration(cfg.Timeout) * time.Second; t > 0 && t < j.setup {
+		j.setup = t
 	}
 	// Some peers (HOUCICS) prefer to call us and, right after a session,
 	// ignore or NAK our dial while they dial us. So batch mode also

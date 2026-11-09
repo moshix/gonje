@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package link runs one NJE connection to one remote node: the OPEN/ACK
 // exchange (connecting side), the SOH ENQ / DLE ACK0 / I / J signon in
 // either role, and then the multileaving main loop (BCB/FCS handling,
@@ -63,7 +65,8 @@ type Handler interface {
 	Dataset(remote string, ds *InboundDataset)
 	// NextFile returns, without removing it, the next file queued for
 	// this remote, or nil.
-	NextFile(remote string) *OutboundFile
+	// busy lists files already in flight (skipped).
+	NextFile(remote string, busy []*OutboundFile) *OutboundFile
 	// FileDone reports that f was accepted (err == nil) or rejected by
 	// the peer. It is not called when the link drops mid-transfer: the
 	// file stays queued and is resent after reconnect.
@@ -86,6 +89,9 @@ type OutboundFile struct {
 	RecFM    byte
 	LRECL    int
 	Punch    bool     // send as a punch file (binary) instead of print
+	OrigNode string   // origin node ("" = us); kept when forwarding
+	Hops     uint16   // NJHGHOPS to send (forwarded files: received + 1)
+	CC       byte     // carriage control kind of the records (CCNone...)
 	Records  [][]byte // EBCDIC (text) or raw (binary) records, no CC
 	Queued   time.Time
 }

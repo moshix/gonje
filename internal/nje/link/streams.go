@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package link
 
 import (
@@ -28,10 +30,12 @@ const (
 	txWaitAck
 )
 
-// txStream is the SYSOUT stream gonje transmits on.
-var txStream = records.SysoutRCB(1)
-
+// Outbound slots: with max_streams = n, up to n files are in flight at
+// once, slot i on SYSOUT stream i+1 (X'99', X'A9', ...). Without the
+// NCCIMRCB feature a buffer holds one RCB, so files interleave buffer by
+// buffer (round robin).
 type txState struct {
+	rcb      byte // stream RCB of this slot
 	state    txPhase
 	f        *OutboundFile
 	next     int       // next record index to send
@@ -39,13 +43,57 @@ type txState struct {
 	reported int       // last progress quarter reported
 }
 
-// txNext returns the next buffer of the outbound file, or nil.
+// initTx creates the outbound slots.
+func (s *Session) initTx() {
+	s.txs = make([]*txState, s.p.MaxStreams)
+	for i := range s.txs {
+		s.txs[i] = &txState{rcb: records.SysoutRCB(i + 1)}
+	}
+}
+
+// txBusy lists the files currently in flight (so NextFile skips them).
+func (s *Session) txBusy() []*OutboundFile {
+	var out []*OutboundFile
+	for _, t := range s.txs {
+		if t.state != txIdle {
+			out = append(out, t.f)
+		}
+	}
+	return out
+}
+
+// txActive counts slots with a transfer in progress.
+func (s *Session) txActive() int { return len(s.txBusy()) }
+
+// txSlot finds the slot transmitting on stream rcb (nil if none).
+func (s *Session) txSlot(rcb byte) *txState {
+	for _, t := range s.txs {
+		if t.rcb == rcb {
+			return t
+		}
+	}
+	return nil
+}
+
+// txNext returns the next outbound buffer of any slot, taking the slots
+// in turn so concurrent files share the link fairly.
 func (s *Session) txNext() []records.Record {
-	t := &s.tx
+	for i := range s.txs {
+		t := s.txs[(s.txTurn+i)%len(s.txs)]
+		if recs := s.txStep(t); recs != nil {
+			s.txTurn = (s.txTurn + i + 1) % len(s.txs)
+			return recs
+		}
+	}
+	return nil
+}
+
+// txStep advances one slot's state machine and returns its next buffer.
+func (s *Session) txStep(t *txState) []records.Record {
 	if t.state == txWaitPermit || t.state == txWaitAck {
 		return nil
 	}
-	if !s.peerFCS.StreamEnabled(txStream) {
+	if !s.peerFCS.StreamEnabled(t.rcb) {
 		return nil // receiver holds the stream (FCS bit off)
 	}
 	switch t.state {
@@ -53,26 +101,42 @@ func (s *Session) txNext() []records.Record {
 		if s.draining || s.peerDrained {
 			return nil // no new transfers while draining / peer refused
 		}
-		f := s.p.Handler.NextFile(s.p.Remote)
+		if !s.settled {
+			if time.Since(s.signedOnAt) < s.p.StreamSettle {
+				return nil // let the peer finish its signon (see streamSettle)
+			}
+			s.settled = true
+		}
+		f := s.p.Handler.NextFile(s.p.Remote, s.txBusy())
 		if f == nil {
 			return nil
 		}
-		*t = txState{state: txWaitPermit, f: f, since: time.Now()}
+		*t = txState{rcb: t.rcb, state: txWaitPermit, f: f, since: time.Now()}
 		s.emit(EvFileOut, L2, fmt.Sprintf("sending %s to %s/%s (%d records, %s)",
 			f.Name, f.ToNode, f.ToUser, len(f.Records), kindName(f.Binary)))
-		s.emit(EvStream, L2, "request "+records.StreamName(txStream))
-		return []records.Record{{RCB: records.RCBRequest, SRCB: txStream}}
+		s.emit(EvStream, L2, "request "+records.StreamName(t.rcb))
+		return []records.Record{{RCB: records.RCBRequest, SRCB: t.rcb}}
 	case txHeader:
 		t.state = txDSHeader
-		return []records.Record{{RCB: txStream, SRCB: records.SRCBJobHeader, Data: s.jobHeader(t.f).Encode()}}
+		return []records.Record{{RCB: t.rcb, SRCB: records.SRCBJobHeader, Data: s.jobHeader(t.f).Encode()}}
 	case txDSHeader:
 		t.state = txData
-		return []records.Record{{RCB: txStream, SRCB: records.SRCBDSHeader, Data: s.dsHeader(t.f).Encode()}}
+		return []records.Record{{RCB: t.rcb, SRCB: records.SRCBDSHeader, Data: s.dsHeader(t.f).Encode()}}
 	case txData:
 		var recs []records.Record
 		size := 6 // DLE STX BCB FCS(2) + EOB
 		for t.next < len(t.f.Records) {
-			r := records.Record{RCB: txStream, SRCB: records.SRCBData, Data: t.f.Records[t.next]}
+			// SYSOUT data SRCB 10cc0000: cc = carriage control kind. The
+			// record starts with its 1-byte length (LRECL incl. the CC
+			// byte), as in figs 20/21 of the manual; spec 02 AMBIG-2 left
+			// open whether BSC/TCP carries it, and the NJE38 trace on
+			// 2026-11-09 settled it: NJE38 sends "50 <80 bytes>" and its
+			// receiver reads byte 0 as the length (DMTXJE PDATAREC
+			// "Don't count length byte"), so without it HOUCICS lost the
+			// first character of every line.
+			rec := t.f.Records[t.next]
+			data := append([]byte{byte(len(rec))}, rec...)
+			r := records.Record{RCB: t.rcb, SRCB: records.SRCBData | t.f.CC<<4, Data: data}
 			n := records.EncodedSize(r)
 			if len(recs) > 0 && size+n > s.bufLimit {
 				break
@@ -82,21 +146,27 @@ func (s *Session) txNext() []records.Record {
 		}
 		sent := len(recs)
 		s.count(func(st *Stats) { st.RecordsOut += sent })
-		s.txProgress()
+		s.txProgress(t)
 		if t.next >= len(t.f.Records) {
 			t.state = txTrailer
 		}
 		if len(recs) == 0 {
-			return s.txNext() // empty file: go straight to the trailer
+			return s.txStep(t) // empty file: go straight to the trailer
 		}
 		return recs
 	case txTrailer:
 		t.state = txEOF
 		tr := &records.JobTrailer{Lines: uint32(len(t.f.Records))}
-		return []records.Record{{RCB: txStream, SRCB: records.SRCBJobTrailer, Data: tr.Encode()}}
+		return []records.Record{{RCB: t.rcb, SRCB: records.SRCBJobTrailer, Data: tr.Encode()}}
 	case txEOF:
 		t.state, t.since = txWaitAck, time.Now()
-		return []records.Record{{RCB: txStream, SRCB: records.SRCBEOF}}
+		// End of file is an EMPTY data record: RCB, SRCB X'80', SCB 00.
+		// NJE38 (DMTXJE, label RDEOF: "MVI RCTTSRC1,X'80' Reset SRCB for
+		// EOF record" + zero tank count) sends EOF this way, and its
+		// receiver rejects SRCB X'00' with NJE939E reason code 01 ("Is
+		// SRCB plausable looking?" tests the X'80' bit). Live HOUCICS
+		// traces 11:20-11:48 on 2026-11-09 failed exactly like that.
+		return []records.Record{{RCB: t.rcb, SRCB: records.SRCBData}}
 	}
 	return nil
 }
@@ -109,8 +179,7 @@ func kindName(binary bool) string {
 }
 
 // txProgress reports every 25% of a transfer of 100+ records.
-func (s *Session) txProgress() {
-	t := &s.tx
+func (s *Session) txProgress(t *txState) {
 	total := len(t.f.Records)
 	if total < 100 {
 		return
@@ -124,11 +193,15 @@ func (s *Session) txProgress() {
 
 // jobHeader builds the NJH for an outbound file (spec 04 section 7).
 func (s *Session) jobHeader(f *OutboundFile) *records.JobHeader {
+	orig := f.OrigNode
+	if orig == "" {
+		orig = s.p.Local
+	}
 	return &records.JobHeader{
-		JobID: f.JobID, JobNo: uint32(f.JobID), JobName: f.JobName,
-		NotifyUser: f.FromUser, NotifyNode: s.p.Local, Entered: f.Queued,
-		OrigNode: s.p.Local, OrigUser: f.FromUser,
-		ExecNode: s.p.Local, ExecUser: f.FromUser,
+		JobID: f.JobID, JobNo: uint32(f.JobID), JobName: f.JobName, Hops: f.Hops,
+		NotifyUser: f.FromUser, NotifyNode: orig, Entered: f.Queued,
+		OrigNode: orig, OrigUser: f.FromUser,
+		ExecNode: orig, ExecUser: f.FromUser,
 		PrintNode: f.ToNode, PrintUser: f.ToUser,
 		PunchNode: f.ToNode, PunchUser: f.ToUser,
 		NRec: uint32(len(f.Records)),
@@ -158,55 +231,58 @@ func flag2(f *OutboundFile) byte {
 
 // txPermit handles A0 (permission to start our stream).
 func (s *Session) txPermit(stream byte) {
-	if s.tx.state != txWaitPermit || stream != txStream {
+	t := s.txSlot(stream)
+	if t == nil || t.state != txWaitPermit {
 		s.log.Warn("unexpected permission for " + records.StreamName(stream))
 		return
 	}
 	s.emit(EvStream, L2, "permit "+records.StreamName(stream)+" received")
-	s.tx.state = txHeader
+	t.state = txHeader
 }
 
 // txDenied handles B0 (receiver cancel / permission denied).
 func (s *Session) txDenied(stream byte, reason []byte) {
-	if s.tx.state == txIdle || stream != txStream {
+	t := s.txSlot(stream)
+	if t == nil || t.state == txIdle {
 		s.log.Warn("unexpected deny for " + records.StreamName(stream))
 		return
 	}
-	if s.tx.state == txWaitPermit {
+	if t.state == txWaitPermit {
 		// Permission refused (receiver drained or busy): the file stays
 		// queued, and we do not ask again until the receiver says it is
 		// ready (D0) or the link restarts (Ch. 9: "treat receiver as
 		// drained until it sends D0").
-		f := s.tx.f
-		s.tx = txState{}
+		f := t.f
+		*t = txState{rcb: t.rcb}
 		s.peerDrained = true
 		s.emit(EvStream, L2, fmt.Sprintf("%s refused %s (reason % X); %s stays queued",
 			s.p.Remote, records.StreamName(stream), reason, f.Name))
 		return
 	}
-	if s.tx.state > txWaitPermit && s.tx.state < txWaitAck {
+	if t.state > txWaitPermit && t.state < txWaitAck {
 		// Receiver cancelled mid-transmission: end the stream with EOF
 		// (allowed answer under the default LRTS rules).
-		s.ctlQueue = append(s.ctlQueue, records.Record{RCB: txStream, SRCB: records.SRCBEOF})
+		s.ctlQueue = append(s.ctlQueue, records.Record{RCB: t.rcb, SRCB: records.SRCBEOF})
 	}
-	s.txFail(fmt.Errorf("rejected by %s (reason % X)", s.p.Remote, reason))
+	s.txFail(t, fmt.Errorf("rejected by %s (reason % X)", s.p.Remote, reason))
 }
 
 // txAcked handles C0 (EOF acknowledged: the peer has the file).
 func (s *Session) txAcked(stream byte) {
-	if s.tx.state != txWaitAck || stream != txStream {
+	t := s.txSlot(stream)
+	if t == nil || t.state != txWaitAck {
 		// E.g. a late C0 for a file we already counted as unconfirmed.
 		s.log.Warn("unexpected EOF ack for " + records.StreamName(stream) + " ignored")
 		return
 	}
-	s.txComplete(" (confirmed)")
+	s.txComplete(t, " (confirmed)")
 }
 
-// txComplete counts the current outbound file as sent and frees the
-// stream. note says whether the peer confirmed it.
-func (s *Session) txComplete(note string) {
-	f := s.tx.f
-	s.tx = txState{}
+// txComplete counts a slot's file as sent and frees the slot. note says
+// whether the peer confirmed it.
+func (s *Session) txComplete(t *txState, note string) {
+	f := t.f
+	*t = txState{rcb: t.rcb}
 	var n int64
 	for _, r := range f.Records {
 		n += int64(len(r))
@@ -223,10 +299,10 @@ func (s *Session) txComplete(note string) {
 	s.p.Handler.FileDone(s.p.Remote, f, nil)
 }
 
-// txFail abandons the current outbound file.
-func (s *Session) txFail(err error) {
-	f := s.tx.f
-	s.tx = txState{}
+// txFail abandons a slot's file.
+func (s *Session) txFail(t *txState, err error) {
+	f := t.f
+	*t = txState{rcb: t.rcb}
 	s.emit(EvError, L2, fmt.Sprintf("file %s failed: %v", f.Name, err))
 	s.p.Handler.FileDone(s.p.Remote, f, err)
 }
@@ -269,6 +345,14 @@ func (s *Session) rxRequest(stream byte) {
 		s.emit(EvStream, L2, "request "+records.StreamName(stream)+" denied (already active)")
 		return
 	}
+	if len(s.rx) >= s.p.MaxStreams {
+		// All our streams are busy (max_streams): refuse; the sender
+		// keeps the file. We send D0 (ready) when a stream frees up.
+		s.ctlQueue = append(s.ctlQueue, records.Record{RCB: records.RCBDeny, SRCB: stream, Data: []byte{0x10, 0x10}})
+		s.refusedFull = true
+		s.emit(EvStream, L2, fmt.Sprintf("request %s refused (%d stream(s) busy)", records.StreamName(stream), len(s.rx)))
+		return
+	}
 	s.rx[stream] = &rxStream{rcb: stream, s: s}
 	s.ctlQueue = append(s.ctlQueue, records.Record{RCB: records.RCBPermit, SRCB: stream})
 	s.emit(EvStream, L2, "request "+records.StreamName(stream)+" received, permitted")
@@ -287,7 +371,7 @@ func (s *Session) rxRecord(r records.Record) {
 	if st.rejected {
 		// We cancelled this job (too big); swallow the rest until the
 		// sender ends the stream with EOF or a transmitter cancel.
-		if r.SRCB == records.SRCBEOF || r.SRCB == records.SRCBCancel || r.Aborted {
+		if isEOF(r) || r.SRCB == records.SRCBCancel || r.Aborted {
 			delete(s.rx, r.RCB)
 		}
 		return
@@ -304,11 +388,17 @@ func (s *Session) rxRecord(r records.Record) {
 		delete(s.rx, r.RCB)
 		s.ctlQueue = append(s.ctlQueue, records.Record{RCB: records.RCBDeny, SRCB: r.RCB})
 		s.emit(EvStream, L2, records.StreamName(r.RCB)+" cancelled by sender")
-	case r.SRCB == records.SRCBEOF:
+	case isEOF(r):
 		delete(s.rx, r.RCB)
 		s.ctlQueue = append(s.ctlQueue, records.Record{RCB: records.RCBAckEOF, SRCB: r.RCB})
 		s.emit(EvStream, L2, records.StreamName(r.RCB)+" EOF, acknowledged")
 		s.rxComplete(st)
+		if s.refusedFull && !s.draining {
+			// Tell the sender we can take a file again (Ch. 9: a sender
+			// treats us as drained after B0 until it sees D0).
+			s.ctlQueue = append(s.ctlQueue, records.Record{RCB: records.RCBReady, SRCB: r.RCB})
+			s.refusedFull = false
+		}
 	case r.SRCB == records.SRCBJobHeader || r.SRCB == records.SRCBJobTrailer:
 		full, err := st.hdr.Add(r.Data)
 		if err != nil {
@@ -351,6 +441,41 @@ func (s *Session) rxRecord(r records.Record) {
 	}
 }
 
+// isEOF reports an end-of-file record on a stream. Two forms exist: the
+// SRCB X'00' form from our NJE spec notes, and the empty data record
+// (SRCB 10cc 0000, i.e. a whole, unspanned data record with no bytes)
+// that NJE38 sends and expects ("Empty tank => end of file"). gonje never
+// sends a genuinely empty data record (empty text lines go as one
+// blank), so a zero-length whole data record is always EOF.
+func isEOF(r records.Record) bool {
+	if r.SRCB == records.SRCBEOF {
+		return true
+	}
+	return r.SRCB&0xCC == 0x80 && len(r.Data) == 0 && !r.Aborted
+}
+
+// stripRecordLength removes the 1-byte record length that starts an
+// unspanned data record (figs 20/21; NJE38 always sends it) and pads a
+// blank-truncated record back to that length. It only strips when the
+// byte really is the length: equal to the bytes that follow, or larger
+// and equal to the data set's LRECL (trailing blanks truncated). A record
+// without the prefix (an older gonje) is kept as it is, with a warning.
+func (s *Session) stripRecordLength(st *rxStream, d []byte) []byte {
+	if len(d) == 0 {
+		return d
+	}
+	n := int(d[0])
+	switch {
+	case n == len(d)-1:
+		return d[1:]
+	case n > len(d)-1 && st.cur != nil && st.cur.Header != nil && int(st.cur.Header.LRECL) == n:
+		return padSegment(d[1:], n)
+	}
+	s.log.Warn(fmt.Sprintf("NONSTANDARD data record without length byte on %s (first byte %02X, %d bytes): kept as is",
+		records.StreamName(st.rcb), d[0], len(d)))
+	return d
+}
+
 // rxData adds a data record, rebuilding spanned records.
 //
 // SRCB = 10cc ss00: cc = carriage control kind, ss = spanning
@@ -374,7 +499,7 @@ func (s *Session) rxData(st *rxStream, r records.Record) {
 	}
 	switch ss {
 	case 0: // whole record
-		st.add(DataRecord{CC: cc, Data: r.Data})
+		st.add(DataRecord{CC: cc, Data: s.stripRecordLength(st, r.Data)})
 	case 2: // first segment
 		if len(r.Data) < 3 {
 			s.log.Warn("short first segment of spanned record")

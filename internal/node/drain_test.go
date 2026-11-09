@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package node
 
 import (
@@ -98,20 +100,11 @@ func TestDrainOutboundInFlight(t *testing.T) {
 	small := filepath.Join(a.dir, "later.txt")
 	os.WriteFile(small, []byte("later\n"), 0o644)
 	a.SendFile("NODEB", "BOB", small)
-	// The peer offers a file: refused, it keeps it.
-	theirs := filepath.Join(b.dir, "theirs.txt")
-	os.WriteFile(theirs, []byte("theirs\n"), 0o644)
-	b.SendFile("NODEA", "ALICE", theirs)
-	b.wait(t, "refusal", 20*time.Second, kindText(link.EvStream, "stays queued"))
-
 	b.wait(t, "big file received", 30*time.Second, kindText(link.EvFileIn, "BIG"))
 	waitState(t, a, "NODEB", Down)
 	waitState(t, b, "NODEA", Down)
 	if q := statusOf(a, "NODEB").Queued; q != 1 {
 		t.Fatalf("A queue %d, want the file queued during the drain", q)
-	}
-	if q := statusOf(b, "NODEA").Queued; q != 1 {
-		t.Fatalf("B queue %d, want its refused file kept", q)
 	}
 	if strings.Contains(a.logBuf.String(), "sending later.txt") {
 		t.Fatal("queued file was started during the drain")
@@ -121,18 +114,27 @@ func TestDrainOutboundInFlight(t *testing.T) {
 	}
 }
 
+// TestDrainInboundInFlight: the peer's big file finishes; a second file
+// it offers while we drain is refused and stays queued at the peer.
+// Both sides use two streams, so the peer's second request goes out
+// while its big file is still being sent (deterministic, no timing).
 func TestDrainInboundInFlight(t *testing.T) {
-	a, b := startPair(t, 5)
+	a, b := startStreams(t, 2)
 	b.SendFile("NODEA", "ALICE", bigFile(t, b.dir, 4))
 	waitTransfer(t, a, "NODEB", false)
 	msg, err := a.Drain("NODEB")
 	if err != nil || !strings.Contains(msg, "waiting for 1 inbound, 0 outbound") {
 		t.Fatalf("%q %v", msg, err)
 	}
+	theirs := filepath.Join(b.dir, "theirs.txt")
+	os.WriteFile(theirs, []byte("theirs\n"), 0o644)
+	b.SendFile("NODEA", "ALICE", theirs)
+	b.wait(t, "refusal", 20*time.Second, kindText(link.EvStream, "stays queued"))
 	a.wait(t, "big file received", 30*time.Second, kindText(link.EvFileIn, "BIG"))
 	waitState(t, a, "NODEB", Down)
-	if q := statusOf(b, "NODEA").Queued; q != 0 {
-		t.Fatalf("B still has %d queued: the file was not completed", q)
+	waitState(t, b, "NODEA", Down)
+	if q := statusOf(b, "NODEA").Queued; q != 1 {
+		t.Fatalf("B queue %d, want only its refused file kept", q)
 	}
 }
 

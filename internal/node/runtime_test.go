@@ -1,13 +1,20 @@
+// Copyright 2026 by moshix
+
 package node
 
 import (
+	"bytes"
+	"fmt"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"gonje/internal/config"
+	"gonje/internal/ebcdic"
 	"gonje/internal/nje/link"
 	"gonje/internal/nje/records"
 	"gonje/internal/nje/tcpip"
@@ -261,8 +268,9 @@ func TestPendingCommands(t *testing.T) {
 	if a.Local().Pending != 1 {
 		t.Fatal("pending not counted")
 	}
-	resp := records.NewResponse(&records.NMR{Flag: 0xA0, FromNode: "NODEA", Out: [8]byte{0xC1, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40}},
-		"NODEB", "SLOW ANSWER")
+	req := &records.NMR{Flag: 0xA0, FromNode: "NODEA"}
+	copy(req.Out[:], ebcdic.Field("ALICE", 8))
+	resp := records.NewResponse(req, "NODEB", "SLOW ANSWER")
 	(&handler{n: a.Node}).NMR("NODEB", resp)
 	ev := a.wait(t, "slow response", 5*time.Second, kindText(link.EvRspIn, "SLOW ANSWER"))
 	if ev.Level != link.L1 || a.Local().Pending != 0 {
@@ -277,4 +285,171 @@ func TestPendingCommands(t *testing.T) {
 	if responseWindow < 5*time.Minute {
 		t.Fatal("response window shorter than 5 minutes")
 	}
+}
+
+// TestResponseToCommandingUser: a message at a non-response level,
+// addressed to the user who sent a command (HOUCICS answers "D T" this
+// way), counts as a response.
+func TestResponseToCommandingUser(t *testing.T) {
+	a, _ := startPair(t, 5)
+	a.mu.Lock()
+	a.remotes["NODEB"].lastCmd = time.Now()
+	a.mu.Unlock()
+	m := records.NewMessages("NODEB", "SYSTEM", "NODEA", "ALICE", "NJE163I TIME=10.55.00 DATE=2026.313")[0]
+	(&handler{n: a.Node}).NMR("NODEB", m)
+	a.wait(t, "response", 5*time.Second, kindText(link.EvRspIn, "NJE163I"))
+	if c := linkCounters(a, "NODEB"); c.RspsIn != 1 {
+		t.Fatalf("responses in %d", c.RspsIn)
+	}
+	// An operator (no user) message, like HOUCICS's "Signon of link ...
+	// complete", stays a message even with a command pending.
+	m = records.NewMessages("NODEB", "SYSTEM", "NODEA", "*", "Signon of link complete")[0]
+	(&handler{n: a.Node}).NMR("NODEB", m)
+	a.wait(t, "operator message", 5*time.Second, kindText(link.EvMsgIn, "Signon of link complete"))
+	// To another user it stays a message.
+	m = records.NewMessages("NODEB", "SYSTEM", "NODEA", "OTHER", "just a message")[0]
+	(&handler{n: a.Node}).NMR("NODEB", m)
+	a.wait(t, "message", 5*time.Second, kindText(link.EvMsgIn, "just a message"))
+}
+
+// TestStuckDialYieldsToInbound: an own dial that hangs (peer ACKed but
+// never signs on) gives way to the peer's inbound call, even when our
+// name is the higher one.
+func TestStuckDialYieldsToInbound(t *testing.T) {
+	b := newTestNode(t, "NODEZ", "NODEA", "BOB", 5) // higher name: normally NAKs 03
+	b.cfg.Remotes[0].Addr = ""
+	b.Start()
+	defer b.Stop()
+	b.mu.Lock()
+	r := b.remotes["NODEA"]
+	r.state, r.dialStart = Connecting, time.Now().Add(-10*time.Second)
+	b.mu.Unlock()
+	c, err := net.Dial("tcp", b.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write((&tcpip.Control{Type: tcpip.TypeOpen, RHost: "NODEA", OHost: "NODEZ"}).Marshal())
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if rep, _, err := tcpip.ReadControl(c); err != nil || rep.Type != tcpip.TypeACK {
+		t.Fatalf("stuck dial did not yield: %+v %v", rep, err)
+	}
+}
+
+// TestGeneralTimeout: an unreachable remote is given up after timeout
+// seconds; connect starts a fresh window.
+func TestGeneralTimeout(t *testing.T) {
+	a := newTestNode(t, "NODEA", "NODEB", "ALICE", 5)
+	a.cfg.Remotes[0].Port = 1 // nobody there
+	a.cfg.Timeout = 1
+	a.opts.RetryMin, a.opts.RetryMax = 100*time.Millisecond, 200*time.Millisecond
+	a.Start()
+	defer a.Stop()
+	a.wait(t, "give up", 5*time.Second, kindText(link.EvLink, "gave up after 1 s, use connect"))
+	st := statusOf(a, "NODEB")
+	if st.State != Down || !st.Held || st.LastErr != "gave up after 1 s, use connect" {
+		t.Fatalf("%+v", st)
+	}
+	if err := a.Connect("NODEB"); err != nil {
+		t.Fatal(err)
+	}
+	if statusOf(a, "NODEB").Held {
+		t.Fatal("connect did not start a fresh window")
+	}
+	a.wait(t, "give up again", 5*time.Second, kindText(link.EvLink, "gave up after 1 s"))
+	if err := a.SetTimeout(-1); err == nil || a.Local().Timeout != 1 {
+		t.Fatal("SetTimeout validation")
+	}
+}
+
+// startStreams starts a pair with max_streams n on both sides.
+func startStreams(t *testing.T, n int) (a, b *testNode) {
+	a = newTestNode(t, "NODEA", "NODEB", "ALICE", 5)
+	b = newTestNode(t, "NODEB", "NODEA", "BOB", 5)
+	a.cfg.Remotes[0].Port, b.cfg.Remotes[0].Port = b.port(), a.port()
+	a.cfg.Remotes[0].MaxStreams, b.cfg.Remotes[0].MaxStreams = n, n
+	a.Start()
+	b.Start()
+	t.Cleanup(func() { a.Stop(); b.Stop() })
+	a.waitUp(t, "NODEB")
+	b.waitUp(t, "NODEA")
+	return a, b
+}
+
+// sendFiles queues k random binary files and returns their contents by
+// name; it also records the most transfers seen running at once.
+func sendFiles(t *testing.T, a *testNode, k, size int) (map[string][]byte, int) {
+	files := map[string][]byte{}
+	for i := 0; i < k; i++ {
+		data := make([]byte, size)
+		rand.New(rand.NewSource(int64(i + 10))).Read(data)
+		name := fmt.Sprintf("f%d.bin", i)
+		p := filepath.Join(a.dir, name)
+		os.WriteFile(p, data, 0o644)
+		files[strings.ToUpper(strings.TrimSuffix(name, ".bin"))] = data
+		if _, err := a.SendFile("NODEB", "BOB", p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	peak := 0
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		st := statusOf(a, "NODEB")
+		peak = max(peak, st.Stats.ActiveOut)
+		if st.Queued == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return files, peak
+}
+
+func checkReceived(t *testing.T, b *testNode, files map[string][]byte) {
+	t.Helper()
+	dir := filepath.Join(b.dir, "inbox")
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if ents, _ := os.ReadDir(dir); len(ents) >= 2*len(files) { // files + .meta
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var ents []os.DirEntry
+	all, _ := os.ReadDir(dir)
+	for _, e := range all {
+		if !strings.HasSuffix(e.Name(), MetaSuffix) {
+			ents = append(ents, e)
+		}
+	}
+	if len(ents) != len(files) {
+		t.Fatalf("%d files received, want %d", len(ents), len(files))
+	}
+	for _, e := range ents {
+		name := strings.Split(e.Name(), ".")[2] // NODEA.ALICE.<NAME>.<ts>.bin
+		got, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if !bytes.Equal(got, files[name]) {
+			t.Fatalf("%s differs", e.Name())
+		}
+	}
+}
+
+func TestMaxStreamsConcurrent(t *testing.T) {
+	a, b := startStreams(t, 3)
+	files, peak := sendFiles(t, a, 3, 300<<10)
+	if peak != 3 {
+		t.Fatalf("at most %d transfers ran at once, want 3", peak)
+	}
+	checkReceived(t, b, files)
+	if st := statusOf(a, "NODEB"); st.MaxStreams != 3 {
+		t.Fatalf("status max streams %d", st.MaxStreams)
+	}
+}
+
+func TestMaxStreamsOneSerialises(t *testing.T) {
+	a, b := startStreams(t, 1)
+	files, peak := sendFiles(t, a, 2, 200<<10)
+	if peak != 1 {
+		t.Fatalf("%d transfers at once with max_streams=1", peak)
+	}
+	checkReceived(t, b, files)
 }

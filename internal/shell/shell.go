@@ -1,8 +1,9 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
 	"fmt"
-	"runtime"
 	"strings"
 	"time"
 
@@ -25,11 +26,16 @@ type Backend interface {
 	SendFile(node, user, path string) (*link.OutboundFile, error)
 	SetLocalName(name string) (int, error)
 	SetListen(ip string, port int) error
+	SetTimeout(sec int) error
 	RemoteConfig(name string) (config.Remote, error)
 	DefineLink(rc config.Remote) error
 	ChangeLink(rc config.Remote) error
 	DeleteLink(name string) (int, error)
 	Counters() node.Counters
+	Routes() []node.RouteStatus
+	SetRoute(rt config.Route) error
+	DeleteRoute(dest string) error
+	SetDefaultRoute(name string) error
 	ResetCounters(name string) error
 }
 
@@ -46,6 +52,8 @@ type Settings struct {
 	HistoryPath string
 	Color       bool         // ANSI colors (tty and no NO_COLOR)
 	Unicode     bool         // Unicode box drawing (else ASCII frames)
+	MsgPane     int          // rows of the messages pane (default 6, min 3)
+	MsgBell     bool         // ring the terminal bell on an incoming message
 	Log         *logx.Logger // operator commands and their results
 }
 
@@ -59,6 +67,7 @@ type Shell struct {
 	events  *Panel // incoming events (bottom pane in split view)
 	results *Panel // command results (top pane in split view)
 	mixed   *Panel // results and events interleaved (split off)
+	msgs    *Panel // incoming messages and responses (own pane)
 	editor  *Editor
 	box     Box
 	now     func() time.Time
@@ -69,7 +78,10 @@ type Shell struct {
 	noteText    string
 	noteUntil   time.Time
 	quitting    bool
-	focus       int          // split view scroll focus (focusCommands/Events)
+	focus       int          // scroll focus (focusCommands/Events/Messages)
+	msgLines    int          // messages pane height
+	msgNew      bool         // a message arrived while the pane was scrolled back
+	bell        bool         // ring the bell at the next draw
 	pg          *pager       // non-nil while long output is being paged
 	held        []link.Event // events held back while paging (single pane)
 }
@@ -91,6 +103,7 @@ func New(be Backend, set Settings) *Shell {
 	}
 	return &Shell{be: be, set: set, level: set.Level, split: set.Split,
 		events: NewPanel(PanelMax), results: NewPanel(ResultsMax), mixed: NewPanel(ResultsMax),
+		msgs: NewPanel(PanelMax), msgLines: msgPaneDefault(set.MsgPane),
 		editor: NewEditor(LoadHistory(set.HistoryPath)), box: box, now: time.Now}
 }
 
@@ -103,9 +116,9 @@ func (s *Shell) addResult(lines ...Line) {
 	s.mixed.Add(lines...)
 }
 
-// versionText is "gonje 0.2 (go1.26 darwin/arm64)".
+// versionText is just "gonje 0.5": no Go compiler or platform details.
 func (s *Shell) versionText() string {
-	return fmt.Sprintf("gonje %s (%s %s/%s)", s.set.Version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	return "gonje " + s.set.Version
 }
 
 // Banner is shown at startup: version, local node, listener and links.
@@ -116,7 +129,7 @@ func (s *Shell) Banner() []Line {
 		listen = "(not listening)"
 	}
 	return []Line{
-		SegLine(Seg{"gonje " + s.set.Version, BoldCyan}, Seg{fmt.Sprintf(" (%s %s/%s)", runtime.Version(), runtime.GOOS, runtime.GOARCH), Dim}),
+		SegLine(Seg{"gonje " + s.set.Version, BoldCyan}),
 		SegLine(Seg{"local node ", Default}, Seg{li.Name, BoldYellow}, Seg{" listening on ", Default},
 			Seg{listen, Cyan}, Seg{fmt.Sprintf(", %d link(s) defined", li.Links), Default}),
 		{Text: "type help for commands, quit to exit", Color: Dim},
@@ -229,9 +242,28 @@ func (s *Shell) HandleEvent(ev link.Event) bool {
 		return true
 	}
 	lines := FormatEvent(ev)
+	if ev.Kind == link.EvMsgIn || ev.Kind == link.EvRspIn {
+		// Messages and responses have their own pane (not duplicated in
+		// the events pane).
+		if s.msgs.Scroll() > 0 {
+			s.msgNew = true
+		}
+		lines[0].BlinkUntil = s.now().Add(blinkFor)
+		s.msgs.Add(lines...)
+		s.bell = s.set.MsgBell
+		return true
+	}
 	s.events.Add(lines...)
 	s.mixed.Add(lines...)
 	return true
+}
+
+// msgPaneDefault is the configured messages pane height or 6.
+func msgPaneDefault(n int) int {
+	if n < minPane {
+		return 6
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------

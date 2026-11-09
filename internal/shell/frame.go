@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -66,10 +68,15 @@ const frameColor = Cyan
 // border draws a horizontal frame line: left corner, a title embedded
 // after one H, H fill, right corner — exactly w columns wide.
 func border(b Box, left, right string, title []Seg, w int) Line {
-	segs := []Seg{{left + b.H, frameColor}}
+	return borderC(b, left, right, title, w, frameColor)
+}
+
+// borderC is border in a given frame color.
+func borderC(b Box, left, right string, title []Seg, w int, fc Color) Line {
+	segs := []Seg{{left + b.H, fc}}
 	used := 2 + 1 // left+H, right
 	if len(title) > 0 {
-		segs = append(segs, Seg{" ", frameColor})
+		segs = append(segs, Seg{" ", fc})
 		used++
 		room := w - used - 2
 		for _, t := range title {
@@ -81,22 +88,31 @@ func border(b Box, left, right string, title []Seg, w int) Line {
 			used += Width(txt)
 			segs = append(segs, Seg{txt, t.Color})
 		}
-		segs = append(segs, Seg{" ", frameColor})
+		segs = append(segs, Seg{" ", fc})
 		used++
 	}
-	segs = append(segs, Seg{strings.Repeat(b.H, max(w-used, 0)) + right, frameColor})
+	segs = append(segs, Seg{strings.Repeat(b.H, max(w-used, 0)) + right, fc})
 	return SegLine(segs...)
 }
 
 // boxed wraps one content row in the side borders with one blank of
 // padding on each side: "│ text… │". The content is clipped to iw-2
 // columns and padded so the right border always lines up.
-func boxed(b Box, content Line, iw int) Line {
-	segs := []Seg{{b.V + " ", frameColor}}
+func boxed(b Box, content Line, iw int) Line { return boxedC(b, content, iw, frameColor) }
+
+// boxedC is boxed in a given frame color.
+func boxedC(b Box, content Line, iw int, fc Color) Line {
+	segs := []Seg{{b.V + " ", fc}}
 	iw -= 2
 	if len(content.Segs) > 0 {
 		left := iw
 		for _, sg := range content.Segs {
+			// Stop when the row is full: Fit(_, 0) would mean "no
+			// limit" and let the rest spill past the right border (the
+			// bug that pushed an event onto the bottom border row).
+			if left <= 0 {
+				break
+			}
 			t := Fit(sg.Text, left)
 			left -= Width(t)
 			segs = append(segs, Seg{t, sg.Color})
@@ -106,7 +122,7 @@ func boxed(b Box, content Line, iw int) Line {
 		t := Fit(content.Text, iw)
 		segs = append(segs, Seg{t, content.Color}, Seg{strings.Repeat(" ", iw-Width(t)), Default})
 	}
-	segs = append(segs, Seg{" " + b.V, frameColor})
+	segs = append(segs, Seg{" " + b.V, fc})
 	return SegLine(segs...)
 }
 
@@ -126,13 +142,59 @@ func (s *Shell) paneHeights(inner int) (top, bottom int) {
 	return inner - bottom, bottom
 }
 
-// innerRows is the number of pane rows for a terminal of rows lines in
-// the current mode (frames take 3 rows in split view, 2 otherwise).
-func (s *Shell) innerRows(rows int) int {
-	if s.framed(rows, s.cols) {
-		return rows - 3
+// msgFrameColor: the messages pane has its own bright white frame so
+// incoming messages stand out.
+const msgFrameColor = BrightWhite
+
+// layout holds the pane sizes for one screen size.
+type layout struct {
+	framed bool
+	msg    int // rows inside the messages box (0 = no box)
+	top    int // split: command pane rows incl. the input line
+	bottom int // split: events pane rows
+	mixed  int // single pane: rows above the input line
+}
+
+// layoutFor computes the panes for rows x cols. Framed split view:
+// outer frame (title, command pane, divider, events, bottom border)
+// above the messages box (title border, msg rows, status border).
+// Framed single pane: outer frame with mixed pane + input line, then the
+// messages box. The messages box keeps s.msgLines rows (min 3) unless
+// the screen is too small for it.
+func (s *Shell) layoutFor(rows, cols int) layout {
+	l := layout{framed: s.framed(rows, cols)}
+	if !l.framed {
+		if s.split {
+			l.top, l.bottom = s.paneHeights(max(rows-1, 2))
+		} else {
+			l.mixed = max(rows-1, 1)
+		}
+		return l
 	}
-	return rows - 1
+	need := 3 // single: top border, input, bottom border (+1 mixed row)
+	if s.split {
+		need = 3 + 2*minPane
+	} else {
+		need++
+	}
+	m := max(s.msgLines, minPane)
+	if rows-(m+2) < need {
+		m = rows - need - 2 // shrink to fit
+	}
+	if m < minPane {
+		m = 0 // no room: no messages box
+	}
+	l.msg = m
+	outer := rows
+	if m > 0 {
+		outer -= m + 2
+	}
+	if s.split {
+		l.top, l.bottom = s.paneHeights(outer - 3)
+	} else {
+		l.mixed = outer - 3
+	}
+	return l
 }
 
 // framed reports whether the screen is big enough for frames.
@@ -145,7 +207,8 @@ func (s *Shell) Resize(delta int) {
 	if !s.split || s.rows == 0 {
 		return
 	}
-	inner := s.innerRows(s.rows)
+	l := s.layoutFor(s.rows, s.cols)
+	inner := l.top + l.bottom
 	_, cur := s.paneHeights(inner)
 	s.bottomLines = cur + delta
 	_, now := s.paneHeights(inner)
@@ -163,26 +226,35 @@ func (s *Shell) note(text string) {
 const (
 	focusCommands = 0
 	focusEvents   = 1
+	focusMessages = 2
 )
 
-// ToggleFocus switches the scroll focus between the panes (split only).
+// ToggleFocus moves the scroll focus to the next pane: commands, events,
+// messages in split view; single pane and messages otherwise.
 func (s *Shell) ToggleFocus() {
 	if s.split {
-		s.focus = 1 - s.focus
+		s.focus = (s.focus + 1) % 3
+		return
+	}
+	if s.focus == focusMessages {
+		s.focus = focusCommands
+	} else {
+		s.focus = focusMessages
 	}
 }
 
 // scrollPane is the pane Ctrl-U/Ctrl-D act on, and its visible height.
 func (s *Shell) scrollPane() (*Panel, int) {
-	inner := s.innerRows(max(s.rows, minFrameRows))
-	if !s.split {
-		return s.mixed, inner - 1
+	l := s.layoutFor(max(s.rows, minFrameRows), max(s.cols, minFrameCols))
+	switch {
+	case s.focus == focusMessages:
+		return s.msgs, max(l.msg, 1)
+	case !s.split:
+		return s.mixed, l.mixed
+	case s.focus == focusEvents:
+		return s.events, l.bottom
 	}
-	top, bottom := s.paneHeights(inner)
-	if s.focus == focusEvents {
-		return s.events, bottom
-	}
-	return s.results, top - 1
+	return s.results, l.top - 1
 }
 
 // Scroll moves the focused pane by half its height: dir < 0 = back in
@@ -249,7 +321,7 @@ func (s *Shell) title() []Seg {
 
 // hints is the status bar text in the bottom border.
 func (s *Shell) hints() []Seg {
-	h := "^U/^D scroll  help  quit"
+	h := "Tab focus  ^U/^D scroll  help  quit"
 	if s.split {
 		h = "Tab focus  ^U/^D scroll  ^G/^V resize  help  quit"
 	}
@@ -323,17 +395,16 @@ func (s *Shell) Render(rows, cols int) Frame {
 			f.Rows = append(f.Rows, boxed(b, l, iw))
 		}
 	}
+	l := s.layoutFor(rows, cols)
 	if s.split {
-		top, bottom := s.paneHeights(rows - 3)
-		add(s.results.Visible(top-1, cw))
+		add(s.results.Visible(l.top-1, cw))
 		in, col := s.inputLine(cw)
 		f.CursorRow, f.CursorCol = len(f.Rows), 2+col
 		add([]Line{in})
-		f.Rows = append(f.Rows, border(b, b.LT, b.RT, s.dividerTitle(bottom), w))
-		add(s.events.Visible(bottom, cw))
+		f.Rows = append(f.Rows, border(b, b.LT, b.RT, s.dividerTitle(l.bottom), w))
+		add(s.events.Visible(l.bottom, cw))
 	} else {
-		inner := rows - 2
-		add(s.mixed.Visible(inner-1, cw))
+		add(s.mixed.Visible(l.mixed, cw))
 		in, col := s.inputLine(cw)
 		f.CursorRow, f.CursorCol = len(f.Rows), 2+col
 		add([]Line{in})
@@ -344,8 +415,80 @@ func (s *Shell) Render(rows, cols int) Frame {
 			hint = append([]Seg{{h, BoldYellow}, {"  ", Default}}, hint...)
 		}
 	}
-	f.Rows = append(f.Rows, border(b, b.BL, b.BR, hint, w))
+	if l.msg == 0 {
+		f.Rows = append(f.Rows, border(b, b.BL, b.BR, hint, w))
+		return f
+	}
+	// Close the outer frame, then the white messages box with the
+	// status hints in its bottom border.
+	f.Rows = append(f.Rows, border(b, b.BL, b.BR, nil, w))
+	f.Rows = append(f.Rows, borderC(b, b.TL, b.TR, s.msgTitle(), w, msgFrameColor))
+	now := s.now()
+	for _, ml := range s.msgs.Visible(l.msg, cw) {
+		f.Rows = append(f.Rows, boxedC(b, s.blinkTag(ml, now), iw, msgFrameColor))
+	}
+	f.Rows = append(f.Rows, borderC(b, b.BL, b.BR, hint, w, msgFrameColor))
 	return f
+}
+
+// Blinking of new messages: the "MSG"/"RSP" tag blinks for blinkFor.
+// SGR 5 is ignored by many terminals, so reverse video is also toggled
+// every blinkPhase (the driver redraws while anything blinks).
+const (
+	blinkFor   = 10 * time.Second
+	blinkPhase = 500 * time.Millisecond
+)
+
+// blinkTag returns l with its tag segment set to blink (reverse video
+// in the "on" half of each phase) while l.BlinkUntil is in the future.
+func (s *Shell) blinkTag(l Line, now time.Time) Line {
+	if !s.set.Color || len(l.Segs) < 2 || !now.Before(l.BlinkUntil) {
+		return l
+	}
+	age := now.Sub(l.BlinkUntil.Add(-blinkFor))
+	c := Blink
+	if (age/blinkPhase)%2 == 0 {
+		c = BlinkRev
+	}
+	segs := append([]Seg(nil), l.Segs...)
+	segs[1].Color = c
+	l.Segs = segs
+	return l
+}
+
+// Blinking reports whether a message tag is still blinking (the driver
+// keeps redrawing every blinkPhase until it stops).
+func (s *Shell) Blinking() bool {
+	if !s.set.Color {
+		return false
+	}
+	now := s.now()
+	for i := len(s.msgs.lines) - 1; i >= 0 && i >= len(s.msgs.lines)-50; i-- {
+		if now.Before(s.msgs.lines[i].BlinkUntil) {
+			return true
+		}
+	}
+	return false
+}
+
+// msgTitle labels the messages box: count, focus, scroll, new arrivals.
+func (s *Shell) msgTitle() []Seg {
+	d := " " + s.box.Dot + " "
+	label := Seg{"messages", BrightWhite}
+	if s.focus == focusMessages {
+		label = Seg{s.focusMark() + "messages", BoldYellow}
+	}
+	segs := []Seg{label, {d, msgFrameColor}, {fmt.Sprintf("%d", s.msgs.Len()), BrightWhite}}
+	if s.msgs.Scroll() == 0 {
+		s.msgNew = false
+	}
+	if h := s.scrollHint(s.msgs); h != "" {
+		segs = append(segs, Seg{d, msgFrameColor}, Seg{h, BoldYellow})
+	}
+	if s.msgNew {
+		segs = append(segs, Seg{d, msgFrameColor}, Seg{"new ↓", BoldGreen})
+	}
+	return segs
 }
 
 // renderBare is the frameless layout for tiny terminals.
@@ -353,8 +496,7 @@ func (s *Shell) renderBare(rows, w int) Frame {
 	s.width = w
 	var f Frame
 	if s.split && rows >= 5 {
-		inner := rows - 1
-		top, bottom := s.paneHeights(inner)
+		top, bottom := s.paneHeights(rows - 1)
 		f.Rows = append(f.Rows, s.results.Visible(top-1, w)...)
 		in, col := s.inputLine(w)
 		f.CursorRow, f.CursorCol = len(f.Rows), col

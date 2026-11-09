@@ -1,10 +1,12 @@
+// Copyright 2026 by moshix
+
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"flag"
+	"fmt"
 	"io"
 	"math/rand"
 	"net"
@@ -271,6 +273,7 @@ func fakeHOUCICS(t *testing.T, batchPort int, answer func(c net.Conn)) (string, 
 					if rec.RCB == records.RCBNMR {
 						m, _ := records.ParseNMR(rec.Data)
 						got <- m.Text()
+						time.Sleep(2 * time.Second) // stay connected like a real node
 						return
 					}
 				}

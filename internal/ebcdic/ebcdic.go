@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package ebcdic converts between IBM code page 037 (EBCDIC) and
 // ISO-8859-1 (Latin-1, whose first 128 code points are ASCII).
 //

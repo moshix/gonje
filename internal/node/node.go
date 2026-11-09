@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 // Package node is the NJE node manager: it owns the listener, one link
 // per configured remote (connect, accept, reconnect), the outbound file
 // queues, the event bus, received-file storage and the auto-answer for
@@ -73,8 +75,10 @@ type Options struct {
 	// this remote (batch mode).
 	PreferInbound bool
 	OnlyRemote    string
-	User          string // local user id for origin fields
-	Log           *logx.Logger
+	// StreamSettle overrides the link's post-signon settle time (tests).
+	StreamSettle time.Duration
+	User         string // local user id for origin fields
+	Log          *logx.Logger
 }
 
 func (o *Options) defaults() {
@@ -140,6 +144,7 @@ type remote struct {
 	bounce      bool      // reconnect after the current session (local rename)
 	pendingCmds int       // commands sent, no response yet (shown in the title)
 	dialStart   time.Time // when the current outbound attempt began
+	tryStart    time.Time // first failed attempt since the last signon (timeout)
 	draining    bool      // "drain": sign off once no transfer is active
 
 	// Counters for "stats" (in memory only, guarded by Node.mu). totals
@@ -228,12 +233,16 @@ type LocalInfo struct {
 	Up       int    // links up
 	Draining int    // links draining
 	Pending  int    // commands still waiting for a first response
+	Timeout  int    // general connect timeout in seconds (0 = never give up)
 }
 
 // Local returns the local node's identity and listener.
 func (n *Node) Local() LocalInfo {
 	n.lmu.RLock()
 	li := LocalInfo{Name: n.cfg.LocalNode, IP: n.cfg.LocalIP, Port: n.cfg.LocalPort}
+	n.mu.Lock()
+	li.Timeout = n.cfg.Timeout
+	n.mu.Unlock()
 	if n.ln != nil {
 		li.Listen = n.ln.Addr().String()
 	}
@@ -429,6 +438,18 @@ func (n *Node) SetLocalName(name string) (int, error) {
 	return bounced, nil
 }
 
+// SetTimeout changes the general connect timeout (seconds, 0 = never).
+func (n *Node) SetTimeout(sec int) error {
+	if sec < 0 || sec > 86400 {
+		return fmt.Errorf("timeout %d out of range 0-86400", sec)
+	}
+	n.mu.Lock()
+	n.cfg.Timeout = sec
+	n.mu.Unlock()
+	n.log.Info(fmt.Sprintf("general timeout set to %d s", sec))
+	return nil
+}
+
 // RemoteConfig returns a copy of a remote's definition.
 func (n *Node) RemoteConfig(name string) (config.Remote, error) {
 	n.mu.Lock()
@@ -557,13 +578,15 @@ func (n *Node) lookup(name string) (*remote, error) {
 func (n *Node) paramsLocked(r *remote) link.Params {
 	return link.Params{
 		Local: n.localName(), Remote: r.cfg.Name, Password: r.cfg.Password,
-		Keepalive:  time.Duration(r.cfg.Keepalive) * time.Second,
-		Handshake:  n.opts.Handshake,
-		StrictBCB:  r.cfg.StrictBCB,
-		StrictTurn: r.cfg.Turn == "strict",
-		EOFWait:    time.Duration(r.cfg.EOFWait) * time.Second,
-		Log:        n.log.With("[" + r.cfg.Name + "]"),
-		Handler:    &handler{n: n},
+		Keepalive:    time.Duration(r.cfg.Keepalive) * time.Second,
+		Handshake:    n.opts.Handshake,
+		StrictBCB:    r.cfg.StrictBCB,
+		StrictTurn:   r.cfg.Turn == "strict",
+		MaxStreams:   r.cfg.MaxStreams, // 0 = link default 1
+		StreamSettle: n.opts.StreamSettle,
+		BufSize:      r.cfg.BufSize, // 0 = link default 8192
+		Log:          n.log.With("[" + r.cfg.Name + "]"),
+		Handler:      &handler{n: n},
 	}
 }
 
@@ -688,6 +711,18 @@ func (n *Node) attemptFailed(r *remote, gen int, err error, retryIn time.Duratio
 		return
 	}
 	msg := "connect failed: " + err.Error()
+	// General "timeout": stop retrying a remote we could not reach for
+	// that long; inbound calls are still accepted, "connect" retries.
+	if r.tryStart.IsZero() {
+		r.tryStart = time.Now()
+	}
+	if t := n.cfg.Timeout; t > 0 && !r.held && time.Since(r.tryStart) >= time.Duration(t)*time.Second {
+		r.held = true
+		r.lastErr = fmt.Sprintf("gave up after %d s, use connect", t)
+		n.log.Warn(r.cfg.Name + ": " + r.lastErr)
+		n.emit(link.EvLink, link.L2, r.cfg.Name, msg+"; "+r.lastErr)
+		return
+	}
 	if !r.held && r.cfg.Addr != "" {
 		if retryIn == 0 {
 			retryIn = n.backoffLocked(r)
@@ -718,6 +753,7 @@ func (n *Node) established(r *remote, gen int, s *link.Session) {
 	// (runSession), so a peer that accepts and drops at once is not
 	// redialled every few seconds forever.
 	r.state, r.sess, r.since, r.lastErr = Up, s, time.Now(), ""
+	r.tryStart = time.Time{}
 	r.cancelDial = nil
 	r.connects++
 	r.connStart, r.base = r.since, link.Stats{}
@@ -955,9 +991,13 @@ func (n *Node) Connect(name string) error {
 		return fmt.Errorf("%s has no remote_host_addr; waiting for it to connect", r.cfg.Name)
 	}
 	if r.state == Up && r.draining {
-		// connect while draining cancels the drain.
+		// connect while draining cancels the drain. Session.Drain waits
+		// for the session goroutine, which may need n.mu: unlock first.
 		r.draining, r.held = false, false
-		r.sess.Drain(false)
+		s := r.sess
+		n.mu.Unlock()
+		s.Drain(false)
+		n.mu.Lock()
 		n.log.Info("drain of " + r.cfg.Name + " cancelled")
 		n.emit(link.EvLink, link.L2, r.cfg.Name, "drain cancelled, link stays up")
 		return nil
@@ -966,12 +1006,21 @@ func (n *Node) Connect(name string) error {
 		return fmt.Errorf("%s is already %s", r.cfg.Name, r.state)
 	}
 	r.held = false
+	r.tryStart = time.Time{} // a fresh timeout window
 	r.retryDelay = n.opts.RetryMin
 	if r.retry != nil {
 		r.retry.Stop()
 	}
 	n.dialLocked(r)
 	return nil
+}
+
+// bufOrDefault is the configured buffer size or the link default.
+func bufOrDefault(n int) int {
+	if n == 0 {
+		return link.DefaultBufSize
+	}
+	return n
 }
 
 // visibleState is the state shown to the operator (Up while draining is
@@ -1006,14 +1055,19 @@ func (n *Node) Drain(name string) (string, error) {
 	if r.retry != nil {
 		r.retry.Stop()
 	}
-	st := r.sess.Stats()
-	r.sess.Drain(true)
+	s, queued := r.sess, len(r.queue)
+	// Session.Drain waits until the session applied it (so no request
+	// slips in afterwards); the session goroutine may need n.mu.
+	n.mu.Unlock()
+	s.Drain(true)
+	st := s.Stats()
+	n.mu.Lock()
 	msg := fmt.Sprintf("%s draining: waiting for %d inbound, %d outbound transfer(s)", r.cfg.Name, st.ActiveIn, st.ActiveOut)
 	if st.ActiveIn+st.ActiveOut == 0 {
 		msg = r.cfg.Name + " draining: no transfer in progress, signing off"
 	}
-	if q := len(r.queue); q > 0 {
-		msg += fmt.Sprintf("; %d queued file(s) stay queued for the next connect", q)
+	if queued > 0 {
+		msg += fmt.Sprintf("; %d queued file(s) stay queued for the next connect", queued)
 	}
 	n.log.Info(msg)
 	n.emit(link.EvLink, link.L2, r.cfg.Name, msg)
@@ -1085,26 +1139,29 @@ func (n *Node) SendMessage(node, user, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("empty message")
 	}
-	r, s, err := n.session(node)
+	// Addressed to the final node; sent over its link or route.
+	dest := strings.ToUpper(node)
+	r, s, err := n.routeSession(dest, "")
 	if err != nil {
 		return err
 	}
-	for _, m := range records.NewMessages(n.localName(), n.opts.User, r.cfg.Name, strings.ToUpper(user), text) {
+	for _, m := range records.NewMessages(n.localName(), n.opts.User, dest, strings.ToUpper(user), text) {
 		if err := s.SendNMR(m); err != nil {
 			return err
 		}
 	}
-	n.emit(link.EvMsgOut, link.L2, r.cfg.Name, fmt.Sprintf("to %s: %s", strings.ToUpper(user), text))
+	n.emit(link.EvMsgOut, link.L2, r.cfg.Name, fmt.Sprintf("to %s/%s%s: %s", dest, strings.ToUpper(user), via(r, dest), text))
 	return nil
 }
 
 // SendCommand sends an unformatted command to node.
 func (n *Node) SendCommand(node, cmd string) error {
-	r, s, err := n.session(node)
+	dest := strings.ToUpper(node)
+	r, s, err := n.routeSession(dest, "")
 	if err != nil {
 		return err
 	}
-	m, err := records.NewCommand(n.localName(), n.opts.User, r.cfg.Name, cmd)
+	m, err := records.NewCommand(n.localName(), n.opts.User, dest, cmd)
 	if err != nil {
 		return err
 	}
@@ -1115,15 +1172,17 @@ func (n *Node) SendCommand(node, cmd string) error {
 	r.lastCmd = time.Now()
 	r.pendingCmds++
 	n.mu.Unlock()
-	n.emit(link.EvCmdOut, link.L2, r.cfg.Name, "command: "+cmd)
+	n.emit(link.EvCmdOut, link.L2, r.cfg.Name, "command for "+dest+via(r, dest)+": "+cmd)
 	return nil
 }
 
 // SendFile queues a file for user at node. It is sent as soon as the
 // link is up. path is tried as given, then relative to send_dir.
 func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
+	// Files for a routed node queue on the via link even if it is down.
+	dest := strings.ToUpper(node)
 	n.mu.Lock()
-	r, err := n.lookup(node)
+	r, _, err := n.linkForLocked(dest, "")
 	n.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -1134,7 +1193,7 @@ func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
 			path = alt
 		}
 	}
-	f, err := PrepareFile(path, r.cfg.Name, strings.ToUpper(user), n.opts.User)
+	f, err := PrepareFile(path, dest, strings.ToUpper(user), n.opts.User)
 	if err != nil {
 		return nil, err
 	}
@@ -1155,21 +1214,23 @@ func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
 	if f.Binary {
 		kind = "binary"
 	}
-	n.emit(link.EvFileOut, link.L2, r.cfg.Name, fmt.Sprintf("%s for %s %s, %d records, %s",
-		f.Name, f.ToUser, how, len(f.Records), kind))
+	n.emit(link.EvFileOut, link.L2, r.cfg.Name, fmt.Sprintf("%s for %s/%s%s %s, %d records, %s",
+		f.Name, dest, f.ToUser, via(r, dest), how, len(f.Records), kind))
 	return f, nil
 }
 
 // LinkStatus describes one remote for "nodes" and Q LINKS.
 type LinkStatus struct {
-	Name    string
-	Addr    string
-	State   State
-	Since   time.Time
-	Held    bool
-	Queued  int
-	LastErr string
-	Stats   link.Stats
+	BufSize    int // buffer size we advertise
+	MaxStreams int // concurrent transfers each way
+	Name       string
+	Addr       string
+	State      State
+	Since      time.Time
+	Held       bool
+	Queued     int
+	LastErr    string
+	Stats      link.Stats
 }
 
 // Status returns the state of every remote, in configuration order.
@@ -1179,7 +1240,7 @@ func (n *Node) Status() []LinkStatus {
 	var out []LinkStatus
 	for _, name := range n.order {
 		r := n.remotes[name]
-		st := LinkStatus{Name: name, State: r.visibleState(), Since: r.since, Held: r.held,
+		st := LinkStatus{Name: name, BufSize: bufOrDefault(r.cfg.BufSize), MaxStreams: max(r.cfg.MaxStreams, 1), State: r.visibleState(), Since: r.since, Held: r.held,
 			Queued: len(r.queue), LastErr: r.lastErr}
 		if r.cfg.Addr != "" {
 			st.Addr = net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
@@ -1201,14 +1262,24 @@ type handler struct{ n *Node }
 
 func (h *handler) Event(ev link.Event) { h.n.bus.Publish(ev) }
 
-func (h *handler) NextFile(remote string) *link.OutboundFile {
+func (h *handler) NextFile(remote string, busy []*link.OutboundFile) *link.OutboundFile {
 	h.n.mu.Lock()
 	defer h.n.mu.Unlock()
 	r := h.n.remotes[remote]
-	if r == nil || len(r.queue) == 0 {
+	if r == nil {
 		return nil
 	}
-	return r.queue[0]
+	// First queued file not already being sent on another stream.
+	for _, f := range r.queue {
+		inFlight := false
+		for _, b := range busy {
+			inFlight = inFlight || b == f
+		}
+		if !inFlight {
+			return f
+		}
+	}
+	return nil
 }
 
 func (h *handler) FileDone(remote string, f *link.OutboundFile, err error) {
@@ -1228,7 +1299,15 @@ func (h *handler) FileDone(remote string, f *link.OutboundFile, err error) {
 
 func (h *handler) Dataset(remote string, ds *link.InboundDataset) {
 	n := h.n
-	path, text, err := SaveDataset(n.cfg.RecvDir, remote, ds, time.Now())
+	if dest := datasetDest(ds); dest != "" && !strings.EqualFold(dest, n.localName()) {
+		n.forwardDataset(remote, ds, strings.ToUpper(dest)) // store-and-forward
+		return
+	}
+	path, text, warn, err := SaveDatasetInfo(n.cfg.RecvDir, remote, ds, time.Now())
+	if warn != "" {
+		n.log.Warn(warn)
+		n.emit(link.EvError, link.L2, remote, warn)
+	}
 	if err != nil {
 		n.emit(link.EvError, link.L2, remote, "cannot save received file: "+err.Error())
 		return
@@ -1248,7 +1327,7 @@ func (h *handler) Dataset(remote string, ds *link.InboundDataset) {
 func (h *handler) NMR(remote string, m *records.NMR) {
 	n := h.n
 	if !strings.EqualFold(m.ToNode, n.localName()) {
-		n.emit(link.EvError, link.L2, remote, fmt.Sprintf("NMR for node %s ignored (no routing)", clean(m.ToNode)))
+		n.forwardNMR(remote, m) // store-and-forward
 		return
 	}
 	who := clean(m.FromNode)
@@ -1276,10 +1355,12 @@ func (h *handler) NMR(remote string, m *records.NMR) {
 		n.mu.Unlock()
 		// A message from a node we sent a command to (within the
 		// window) counts as a response if it has the RSCS response level
-		// or is addressed to the user who issued the command (or to no
-		// user): HOUCICS answers "D T" at another level, to MOSHE.
-		toUs := m.OutUser() == "" || strings.EqualFold(m.OutUser(), n.opts.User)
-		if recent && (m.IsResponse() || toUs) {
+		// or is addressed to the user who issued the command: HOUCICS
+		// answers "D T" at another level, to MOSHE.
+		// Operator/no-user messages (e.g. HOUCICS's "Signon of link ...
+		// complete") are never responses.
+		toUs := m.OutUser() != "" && strings.EqualFold(m.OutUser(), n.opts.User)
+		if recent && toUs {
 			k = link.EvRspIn
 			n.mu.Lock()
 			if r := n.remotes[remote]; r != nil {
@@ -1292,9 +1373,13 @@ func (h *handler) NMR(remote string, m *records.NMR) {
 		return
 	}
 	n.emit(link.EvCmdIn, link.L1, remote, fmt.Sprintf("from %s: %s", who, text))
-	_, s, err := n.session(remote)
+	// Responses go back to the command's origin node: over its own link
+	// or route, else over the link the command arrived on.
+	_, s, err := n.routeSession(m.FromNode, "")
 	if err != nil {
-		return
+		if _, s, err = n.session(remote); err != nil {
+			return
+		}
 	}
 	// SendNMR only queues (it never blocks), so it is safe to call here
 	// on the session goroutine; the responses go out on our next turns.

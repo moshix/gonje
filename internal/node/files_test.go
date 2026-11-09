@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package node
 
 import (
@@ -150,6 +152,11 @@ func TestSaveDataset(t *testing.T) {
 		}
 	}
 	// A failed write leaves nothing: the directory is not writable.
+	// root ignores directory permissions (the remote build host runs the
+	// tests as root), so a read-only directory can't make the write fail.
+	if os.Geteuid() == 0 {
+		return
+	}
 	ro := filepath.Join(dir, "ro")
 	os.Mkdir(ro, 0o500)
 	if _, _, err := SaveDataset(ro, "NODEX", bin, now); err == nil {

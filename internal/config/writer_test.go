@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package config
 
 import (
@@ -197,5 +199,122 @@ func TestValidateRemote(t *testing.T) {
 		if err := ValidateRemote(&r, "NODEA"); err == nil {
 			t.Errorf("accepted %+v", r)
 		}
+	}
+}
+
+func TestBufferSizeOption(t *testing.T) {
+	c, err := Parse(strings.NewReader("local_node=A REMOTE_HOST_NAME=B REMOTE_BUFFERSIZE=1012"))
+	if err != nil || c.Remote("B").BufSize != 1012 {
+		t.Fatalf("%v %+v", err, c)
+	}
+	for _, bad := range []string{"299", "32769", "x"} {
+		if _, err := Parse(strings.NewReader("local_node=A remote_host_name=B remote_buffersize=" + bad)); err == nil {
+			t.Errorf("buffersize %s accepted", bad)
+		}
+	}
+	if err := ValidateRemote(&Remote{Name: "B", Port: 1, Keepalive: 1, BufSize: 100}, "A"); err == nil {
+		t.Fatal("ValidateRemote accepted 100")
+	}
+	p := writeTemp(t, "local_node=A\nremote_host_name=B\n", 0o644)
+	f, _ := OpenFile(p)
+	f.SetRemote(&Remote{Name: "B", Port: 175, Keepalive: 10, BufSize: 4096})
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if c := load(t, p); c.Remote("B").BufSize != 4096 {
+		t.Fatal("buffersize not saved")
+	}
+}
+
+func TestMaxStreamsTimeoutAndOldKeys(t *testing.T) {
+	c, err := Parse(strings.NewReader("local_node=A timeout=120 remote_host_name=B remote_max-streams=3 " +
+		"remote_host_name=C REMOTE_MAX_STREAMS=8 remote_eof_wait=10"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Timeout != 120 || c.Remote("B").MaxStreams != 3 || c.Remote("C").MaxStreams != 8 {
+		t.Fatalf("%+v %+v %+v", c, c.Remote("B"), c.Remote("C"))
+	}
+	if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "remote_eof_wait") {
+		t.Fatalf("old key not warned: %v", c.Warnings)
+	}
+	for _, bad := range []string{"remote_host_name=B remote_max_streams=0", "remote_host_name=B remote_max_streams=9", "timeout=-1"} {
+		if _, err := Parse(strings.NewReader("local_node=A " + bad)); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	p := writeTemp(t, "local_node=A\nremote_host_name=B remote_max-streams=2\n", 0o644)
+	f, _ := OpenFile(p)
+	f.SetLocal("timeout", "300")
+	f.SetRemote(&Remote{Name: "B", Port: 175, Keepalive: 10, MaxStreams: 4})
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c = load(t, p)
+	if c.Timeout != 300 || c.Remote("B").MaxStreams != 4 {
+		t.Fatalf("saved %+v %+v", c, c.Remote("B"))
+	}
+	if b, _ := os.ReadFile(p); !strings.Contains(string(b), "remote_max-streams=4") {
+		t.Fatalf("hyphen key not updated in place:\n%s", b)
+	}
+}
+
+func TestRoutesConfig(t *testing.T) {
+	text := "local_node=A\nroute=MVSF,MVSB,MVSC   # via B, else C\nroute=far,mvsb\ndefault_route=MVSC\n" +
+		"remote_host_name=MVSB\nremote_host_name=MVSC\n"
+	c, err := Parse(strings.NewReader(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Routes) != 2 || c.Routes[0] != (Route{"MVSF", "MVSB", "MVSC"}) || c.Routes[1] != (Route{"FAR", "MVSB", ""}) ||
+		c.DefaultRoute != "MVSC" {
+		t.Fatalf("%+v %q", c.Routes, c.DefaultRoute)
+	}
+	bad := []string{
+		"local_node=A default_route=NOPE remote_host_name=B",  // undefined default route
+		"local_node=A route=X,NOPE remote_host_name=B",        // via not a link
+		"local_node=A route=X,B,NOPE remote_host_name=B",      // alt not a link
+		"local_node=A route=A,B remote_host_name=B",           // to ourselves
+		"local_node=A route=B,B remote_host_name=B",           // via itself
+		"local_node=A route=X remote_host_name=B",             // no via
+		"local_node=A route=X,B route=X,B remote_host_name=B", // twice
+		"local_node=A route=TOOLONGNAME,B remote_host_name=B", // bad name
+	}
+	for _, b := range bad {
+		if _, err := Parse(strings.NewReader(b)); err == nil {
+			t.Errorf("accepted %q", b)
+		}
+	}
+	// Writer round trip: change, add, delete routes; default route.
+	p := writeTemp(t, text, 0o644)
+	f, _ := OpenFile(p)
+	f.SetRoute(Route{"MVSF", "MVSC", ""})
+	f.SetRoute(Route{"NEW", "MVSB", "MVSC"})
+	f.DeleteRoute("far")
+	f.SetLocal("default_route", "MVSB")
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c = load(t, p)
+	if len(c.Routes) != 2 || c.Routes[0] != (Route{"MVSF", "MVSC", ""}) || c.Routes[1] != (Route{"NEW", "MVSB", "MVSC"}) ||
+		c.DefaultRoute != "MVSB" {
+		t.Fatalf("after save %+v %q", c.Routes, c.DefaultRoute)
+	}
+	if b, _ := os.ReadFile(p); !strings.Contains(string(b), "route=MVSF,MVSC   # via B, else C") {
+		t.Fatalf("route comment lost:\n%s", b)
+	}
+	f, _ = OpenFile(p)
+	f.DeleteLocal("default_route")
+	f.Save()
+	if load(t, p).DefaultRoute != "" {
+		t.Fatal("default route not deleted")
+	}
+	// First route in a file without any: placed before the remote blocks.
+	p = writeTemp(t, "local_node=A\nremote_host_name=B\n", 0o644)
+	f, _ = OpenFile(p)
+	f.SetRoute(Route{"X", "B", ""})
+	f.Save()
+	if b, _ := os.ReadFile(p); string(b) != "local_node=A\nroute=X,B\nremote_host_name=B\n" {
+		t.Fatalf("%q", b)
 	}
 }

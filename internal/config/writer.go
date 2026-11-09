@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package config
 
 import (
@@ -75,7 +77,7 @@ func scanLine(n int, line string) []ftok {
 			j++
 		}
 		k, v, _ := strings.Cut(line[i:j], "=")
-		out = append(out, ftok{line: n, start: i, end: j, key: strings.ToLower(k), val: v})
+		out = append(out, ftok{line: n, start: i, end: j, key: normKey(k), val: v})
 		i = j
 	}
 	return out
@@ -158,7 +160,7 @@ func (f *File) insertLine(at int, text string) {
 // Existing tokens are updated in place; otherwise a new line is added
 // after the last top-level setting before the first remote block.
 func (f *File) SetLocal(key, val string) {
-	lk := strings.ToLower(key)
+	lk := normKey(key)
 	toks := f.toks()
 	found := false
 	for _, t := range toks {
@@ -212,9 +214,13 @@ func remoteKeys(r *Remote, toks []ftok) [][2]string {
 			}
 		}
 	}
-	eofWait := ""
-	if r.EOFWait > 0 {
-		eofWait = strconv.Itoa(r.EOFWait)
+	bufSize := ""
+	if r.BufSize > 0 {
+		bufSize = strconv.Itoa(r.BufSize)
+	}
+	maxStreams := ""
+	if r.MaxStreams > 0 {
+		maxStreams = strconv.Itoa(r.MaxStreams)
 	}
 	return [][2]string{
 		{"remote_host_addr", r.Addr},
@@ -223,7 +229,8 @@ func remoteKeys(r *Remote, toks []ftok) [][2]string {
 		{"remote_password", r.Password},
 		{"remote_strict_bcb", strict},
 		{"remote_turn", turn},
-		{"remote_eof_wait", eofWait},
+		{"remote_max_streams", maxStreams},
+		{"remote_buffersize", bufSize},
 	}
 }
 
@@ -314,6 +321,91 @@ func (f *File) DeleteRemote(name string) bool {
 	}
 	f.lines = out
 	return true
+}
+
+// routeLine reports whether line n is a route=<dest>,... line and its
+// destination. A route line holds only the route (plus a comment).
+func (f *File) routeLine(n int) (string, bool) {
+	t := scanLine(n, f.lines[n])
+	if len(t) == 0 || t[0].key != "route" {
+		return "", false
+	}
+	dest, _, _ := strings.Cut(t[0].val, ",")
+	return strings.ToUpper(dest), true
+}
+
+// commentOf returns the " # ..." part of a line, if any.
+func commentOf(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] == '#' && (i == 0 || isSep(line[i-1])) {
+			j := i // keep the blanks before the comment as they were
+			for j > 0 && (line[j-1] == ' ' || line[j-1] == '\t') {
+				j--
+			}
+			if j == 0 {
+				return " " + line[i:]
+			}
+			return line[j:]
+		}
+	}
+	return ""
+}
+
+// SetRoute adds or replaces the route=<dest>,<via>[,<alt>] line for
+// r.Dest. A new line goes after the last route line, else after the
+// last top-level setting before the first remote block.
+func (f *File) SetRoute(r Route) {
+	text := "route=" + r.String()
+	last := -1
+	for n := range f.lines {
+		if dest, ok := f.routeLine(n); ok {
+			if dest == r.Dest {
+				f.lines[n] = text + commentOf(f.lines[n])
+				return
+			}
+			last = n
+		}
+	}
+	if last >= 0 {
+		f.insertLine(last+1, text)
+		return
+	}
+	// Like SetLocal: after the top-level settings.
+	toks := f.toks()
+	at := len(f.lines)
+	for i, t := range toks {
+		if t.key == "remote_host_name" {
+			at = t.line
+			if i > 0 {
+				at = toks[i-1].line + 1
+			}
+			break
+		}
+	}
+	f.insertLine(at, text)
+}
+
+// DeleteRoute removes the route line for dest; it reports whether one
+// existed.
+func (f *File) DeleteRoute(dest string) bool {
+	for n := range f.lines {
+		if d, ok := f.routeLine(n); ok && d == strings.ToUpper(dest) {
+			f.lines = append(f.lines[:n], f.lines[n+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteLocal removes a top-level key (e.g. default_route).
+func (f *File) DeleteLocal(key string) {
+	lk := normKey(key)
+	toks := f.toks()
+	for i := len(toks) - 1; i >= 0; i-- {
+		if toks[i].key == lk {
+			f.removeToken(toks[i])
+		}
+	}
 }
 
 // Save checks that the edited text still loads, then writes it

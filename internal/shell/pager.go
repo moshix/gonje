@@ -1,3 +1,5 @@
+// Copyright 2026 by moshix
+
 package shell
 
 import (
@@ -30,12 +32,11 @@ func (s *Shell) pageRows() int {
 	if s.rows == 0 {
 		return 0
 	}
-	inner := s.innerRows(s.rows)
+	l := s.layoutFor(s.rows, s.cols)
 	if s.split {
-		top, _ := s.paneHeights(inner)
-		return top - 1 // the bottom row of the top pane is the input line
+		return l.top - 1 // the bottom row of the top pane is the input line
 	}
-	return inner - 1
+	return l.mixed
 }
 
 // showResult adds a command's output, paging it if it is taller than the
@@ -54,6 +55,7 @@ func (s *Shell) showResult(lines []Line, used int) {
 // addPage adds as many lines as fit in rows rows (at least one).
 func (s *Shell) addPage(rows int) {
 	p := s.pg
+	rows = max(rows, 1) // tiny panes: still one line per page
 	added := 0
 	for p.next < len(p.lines) && rows > 0 {
 		n := len(wrapLine(p.lines[p.next], s.width))
