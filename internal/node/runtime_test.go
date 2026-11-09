@@ -50,6 +50,15 @@ func TestDefineChangeDeleteLink(t *testing.T) {
 	if got, _ := a.RemoteConfig("nodec"); got.Keepalive != 30 || got.Addr != "127.0.0.1" {
 		t.Fatalf("change not applied: %+v", got)
 	}
+	// Every option is applied, not only address/port/keepalive (second
+	// review M4).
+	got.Turn, got.MaxStreams, got.BufSize = "strict", 4, 1012
+	if err := a.ChangeLink(got); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := a.RemoteConfig("nodec"); got.Turn != "strict" || got.MaxStreams != 4 || got.BufSize != 1012 {
+		t.Fatalf("turn/max_streams/buffersize not applied: %+v", got)
+	}
 	if err := a.ChangeLink(config.Remote{Name: "NOPE", Port: 1, Keepalive: 1}); err == nil {
 		t.Fatal("change of unknown link accepted")
 	}
@@ -96,12 +105,15 @@ func TestSetLocalNameBounces(t *testing.T) {
 	if a.Local().Name != "NODEX" {
 		t.Fatal("name not changed")
 	}
+	// Both ends must be Up: B can see the signon complete before A has
+	// finished its side (established()), and A's send would then fail
+	// with "CONNECTING" (the flake of second review m11).
 	deadline := time.Now().Add(10 * time.Second)
-	for b.state("NODEX") != Up && time.Now().Before(deadline) {
+	for (b.state("NODEX") != Up || a.state("NODEB") != Up) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if b.state("NODEX") != Up {
-		t.Fatalf("link did not come back under the new name: %+v", b.Status())
+	if b.state("NODEX") != Up || a.state("NODEB") != Up {
+		t.Fatalf("link did not come back under the new name: %+v / %+v", b.Status(), a.Status())
 	}
 	if err := a.SendMessage("NODEB", "BOB", "renamed"); err != nil {
 		t.Fatal(err)
@@ -409,7 +421,7 @@ func checkReceived(t *testing.T, b *testNode, files map[string][]byte) {
 	dir := filepath.Join(b.dir, "inbox")
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if ents, _ := os.ReadDir(dir); len(ents) >= 2*len(files) { // files + .meta
+		if metas, _ := filepath.Glob(filepath.Join(dir, "*"+MetaSuffix)); len(metas) >= len(files) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -417,7 +429,8 @@ func checkReceived(t *testing.T, b *testNode, files map[string][]byte) {
 	var ents []os.DirEntry
 	all, _ := os.ReadDir(dir)
 	for _, e := range all {
-		if !strings.HasSuffix(e.Name(), MetaSuffix) {
+		// Skip sidecars and the spool id counter (.spoolseq).
+		if !strings.HasSuffix(e.Name(), MetaSuffix) && !strings.HasPrefix(e.Name(), ".") {
 			ents = append(ents, e)
 		}
 	}
@@ -452,4 +465,90 @@ func TestMaxStreamsOneSerialises(t *testing.T) {
 		t.Fatalf("%d transfers at once with max_streams=1", peak)
 	}
 	checkReceived(t, b, files)
+}
+
+// TestInboundNat: our ACK names the NATOUT address; an OPEN addressed to
+// NATOUT (or to any other OIP: OIP is only logged, as before) is accepted.
+func TestInboundNat(t *testing.T) {
+	a := newTestNode(t, "NODEA", "NODEB", "ALICE", 5)
+	a.cfg.Remotes[0].Addr = ""
+	a.cfg.Remotes[0].NatOut = "35.192.26.118"
+	a.Start()
+	defer a.Stop()
+	for _, oip := range []net.IP{net.IPv4(35, 192, 26, 118), net.IPv4(10, 9, 9, 9)} {
+		c, err := net.Dial("tcp", a.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Write((&tcpip.Control{Type: tcpip.TypeOpen, RHost: "NODEB", OHost: "NODEA", OIP: oip}).Marshal())
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		r, _, err := tcpip.ReadControl(c)
+		c.Close()
+		if err != nil || r.Type != tcpip.TypeACK || !r.RIP.Equal(net.IPv4(35, 192, 26, 118)) {
+			t.Fatalf("OIP %s: %+v %v", oip, r, err)
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for statusOf(a, "NODEB").State != Down && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !strings.Contains(a.logBuf.String(), "addressed to OIP 10.9.9.9") {
+		t.Fatal("unknown OIP not logged")
+	}
+}
+
+// TestDialBindsNatIn: the outbound connection uses NATIN as source.
+func TestDialBindsNatIn(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.2:0")
+	if err != nil {
+		t.Skip("127.0.0.2 not available on this host")
+	}
+	probe.Close()
+	peer, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer peer.Close()
+	src := make(chan string, 1)
+	go func() {
+		c, err := peer.Accept()
+		if err == nil {
+			src <- c.RemoteAddr().(*net.TCPAddr).IP.String()
+			c.Close()
+		}
+	}()
+	a := newTestNode(t, "NODEA", "NODEB", "ALICE", 5)
+	a.cfg.Remotes[0].Port = peer.Addr().(*net.TCPAddr).Port
+	a.cfg.Remotes[0].NatIn = "127.0.0.2"
+	a.Start()
+	defer a.Stop()
+	select {
+	case ip := <-src:
+		if ip != "127.0.0.2" {
+			t.Fatalf("dialled from %s", ip)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connection")
+	}
+}
+
+func TestLinesAndEvents(t *testing.T) {
+	a, _ := startPair(t, 5)
+	ev := a.wait(t, "any event naming NODEB", 5*time.Second, func(e link.Event) bool { return e.Node == "NODEB" })
+	_ = ev
+	if err := a.DefineLink(config.Remote{Name: "NODEX", Port: 1, Keepalive: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.DefineLink(config.Remote{Name: "NODEY", Port: 1, Keepalive: 5, Line: 1, LineSet: true}); err == nil {
+		t.Fatal("duplicate line accepted")
+	}
+	rc, _ := a.RemoteConfig("NODEX")
+	if rc.Line != 1 || !rc.LineSet {
+		t.Fatalf("next free line: %+v", rc)
+	}
+	a.SendMessage("NODEB", "BOB", "x")
+	ev = a.wait(t, "msg out", 5*time.Second, kindText(link.EvMsgOut, "x"))
+	if !ev.HasLine || ev.Line != 0 {
+		t.Fatalf("event without line: %+v", ev)
+	}
+	if !strings.Contains(a.logBuf.String(), "[LINE 0 NODEB]") {
+		t.Fatal("log lacks the line")
+	}
 }

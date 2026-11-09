@@ -96,16 +96,24 @@ type File struct {
 	ToNode   string
 	ToUser   string
 	Time     string // INMFTIME as sent (yyyymmddhhmmss...)
-	Utility  string // last INMUTILN (INMCOPY, IEBCOPY ...)
+	Utility  string // INMUTILN of the first INMR02 (INMCOPY, IEBCOPY ...)
 	DSOrg    uint16
 	RECFM    uint16
 	LRECL    int
 	Size     uint64
 	Records  [][]byte // logical data records (EBCDIC)
+
+	inmr02 int  // number of INMR02 records
+	pds    bool // some INMR02 named IEBCOPY or DSORG PO
 }
 
-// PDS reports a partitioned data set (IEBCOPY unload).
-func (f *File) PDS() bool { return f.DSOrg&DSOrgPO != 0 || f.Utility == "IEBCOPY" }
+// PDS reports a partitioned data set (IEBCOPY unload). TSO and NJE38
+// TRANSMIT of a PDS send two INMR02 records: IEBCOPY/PO for the PDS,
+// then INMCOPY/PS for the unloaded temporary data set. So any IEBCOPY
+// or PO INMR02, or more than one INMR02, means a PDS.
+func (f *File) PDS() bool {
+	return f.pds || f.inmr02 > 1 || f.DSOrg&DSOrgPO != 0 || f.Utility == "IEBCOPY"
+}
 
 // Fixed reports RECFM F/FB.
 func (f *File) Fixed() bool { return f.RECFM&0xC000 == 0x8000 }
@@ -218,7 +226,16 @@ func (f *File) apply(c *Control) {
 	case "INMR02":
 		// Data set attributes come from INMR02. INMR03 describes the
 		// transmission records themselves (e.g. RECFM X'0001'), not the
-		// data set, so it is not used here.
+		// data set, so it is not used here. The attributes of the
+		// original data set are in the first INMR02; a second one
+		// (PDS) describes IEBCOPY's unload data set.
+		f.inmr02++
+		if strings.EqualFold(c.Str(KeyUtilN, ""), "IEBCOPY") || uint16(c.Num(KeyDSOrg))&DSOrgPO != 0 {
+			f.pds = true
+		}
+		if f.inmr02 > 1 {
+			return
+		}
 		if v := c.Str(KeyUtilN, ""); v != "" {
 			f.Utility = v
 		}
@@ -241,21 +258,38 @@ func (f *File) apply(c *Control) {
 }
 
 // StripSequenceNumbers removes columns 73-80 from fixed 80-byte card
-// images when every record has 8 digits there (ISPF/RFE line numbers).
-func StripSequenceNumbers(recs [][]byte) [][]byte {
+// images when every record has 8 digits there and the numbers rise
+// strictly (ISPF/IEBUPDTE line numbers). Numeric data that merely ends
+// in digits is kept as it is. A single record is stripped only when its
+// number is a usual first line number (10, 100, 1000 or 10000), as a
+// one-line file edited with ISPF has (HOUCICS sends those). The second
+// result reports whether anything was stripped.
+func StripSequenceNumbers(recs [][]byte) ([][]byte, bool) {
 	if len(recs) == 0 {
-		return recs
+		return recs, false
 	}
+	prev := -1
 	for _, r := range recs {
 		if len(r) != 80 || !isDigits(r[72:80]) {
-			return recs
+			return recs, false
 		}
+		n := 0
+		for _, b := range r[72:80] {
+			n = n*10 + int(b-0xF0)
+		}
+		if n <= prev {
+			return recs, false
+		}
+		prev = n
+	}
+	if len(recs) == 1 && prev != 10 && prev != 100 && prev != 1000 && prev != 10000 {
+		return recs, false
 	}
 	out := make([][]byte, len(recs))
 	for i, r := range recs {
 		out[i] = r[:72]
 	}
-	return out
+	return out, true
 }
 
 func isDigits(e []byte) bool {

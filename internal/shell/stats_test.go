@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"gonje/internal/config"
+	"gonje/internal/nje/link"
 	"gonje/internal/node"
 )
 
@@ -38,7 +39,7 @@ func TestStatsCommand(t *testing.T) {
 		}
 	}
 	one := joinText(s.Exec("stats nodeb").Lines)
-	for _, want := range []string{"link NODEB", "session uptime", "1m00s", "connects/failures", "3/1",
+	for _, want := range []string{"LINE 0 NODEB", "session uptime", "1m00s", "connects/failures", "3/1",
 		"null buffers in/out", "77/0", "BCB seq errors", "NAKs received", "idle reply delay", "responses in/out", "0/2"} {
 		if !strings.Contains(one, want) {
 			t.Errorf("stats NODEB lacks %q:\n%s", want, one)
@@ -89,7 +90,7 @@ func TestStatsTableWidths(t *testing.T) {
 		}
 	}
 	// State colors as in nodes.
-	if full[1].Segs[2].Color != BoldGreen || full[2].Segs[2].Color != Red {
+	if full[1].Segs[3].Color != BoldGreen || full[2].Segs[3].Color != Red {
 		t.Fatalf("state colors %+v", full[1].Segs)
 	}
 }
@@ -115,7 +116,7 @@ func TestDrainCommand(t *testing.T) {
 
 func TestCmdHintAndPendingTitle(t *testing.T) {
 	s, be := newTestShell(t)
-	if l := s.Exec("cmd nodeb d t").Lines[0].Text; l != "command sent to NODEB; responses will appear in the events pane" {
+	if l := s.Exec("cmd nodeb d t").Lines[0].Text; l != "command sent to NODEB; responses will appear in the messages pane" {
 		t.Fatalf("%q", l)
 	}
 	be.local.Pending = 2
@@ -191,10 +192,60 @@ func TestRouteCommands(t *testing.T) {
 	if len(lines) != 1+2+1+1 || !strings.HasPrefix(strings.TrimSpace(lines[4].Text), "*") {
 		t.Fatalf("rows:\n%s", list)
 	}
-	if lines[1].Segs[4].Color != BoldGreen || lines[2].Segs[4].Color != Red {
+	if lines[1].Segs[5].Color != BoldGreen || lines[2].Segs[5].Color != Red {
 		t.Fatalf("state colors %+v", lines[1].Segs)
 	}
 	if joinText(s.Exec("routes").Lines) != list {
 		t.Fatal("routes alias")
+	}
+}
+
+// TestLineReferences: wherever a node is accepted, "line <n>", "l<n>"
+// or a bare number select the node with that LINE number.
+func TestLineReferences(t *testing.T) {
+	s, be := newTestShell(t)
+	cases := []struct{ in, call string }{
+		{"connect line 1", "connect NODEC"},
+		{"drop l1", "drop NODEC"},
+		{"drain 0", "drain NODEB"},
+		{"connect nodec", "connect nodec"}, // names still work
+		{"msg 1 bob  two   blanks", "msg NODEC|bob|two   blanks"},
+		{"msg line 0 bob 7 dwarfs", "msg NODEB|bob|7 dwarfs"},
+		{"cmd l0 q sys", "cmd NODEB|q sys"},
+		{"send 1 bob f.txt", "send NODEC|bob|f.txt"},
+		{"route far to line 0 alt l1", "route FAR,NODEB,NODEC"},
+		{"stats reset 1", "reset NODEC"},
+	}
+	for _, c := range cases {
+		be.calls = nil
+		s.Exec(c.in)
+		if len(be.calls) == 0 || be.calls[len(be.calls)-1] != c.call {
+			t.Errorf("%q -> %q, want %q", c.in, be.calls, c.call)
+		}
+	}
+	// A number that is no line stays as typed (and fails as a node name).
+	be.calls = nil
+	s.Exec("connect 7")
+	if be.calls[0] != "connect 7" {
+		t.Fatalf("%q", be.calls)
+	}
+	// Tables show the LINE column first; events name the line.
+	if !strings.HasPrefix(s.Exec("nodes").Lines[0].Text, "LINE NODE") {
+		t.Fatal("nodes header")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(s.Exec("routes").Lines[0].Text), "LINE") {
+		t.Fatal("routes header")
+	}
+	ev := link.Event{Kind: link.EvLink, Level: 2, Node: "HOUCICS", Line: 0, HasLine: true, Text: "link up"}
+	if l := FormatEvent(ev)[0].Text; !strings.Contains(l, "LINE 0 HOUCICS link up") {
+		t.Fatalf("%q", l)
+	}
+	// link define: line= and NAT options.
+	s.Exec("link define nodex 1.2.3.4 line=7 natin=10.1.1.2 natout=35.192.26.118")
+	if rc := be.remotes["NODEX"]; rc.Line != 7 || !rc.LineSet || rc.NatIn != "10.1.1.2" || rc.NatOut != "35.192.26.118" {
+		t.Fatalf("%+v", rc)
+	}
+	if r := s.Exec("link change nodex natout=999.1.1.1"); r.Lines[0].Color != Red {
+		t.Fatal("bad NAT address accepted")
 	}
 }

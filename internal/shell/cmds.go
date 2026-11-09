@@ -20,6 +20,7 @@ func usage(u string) Result { return Result{Lines: []Line{{Text: "usage: " + u, 
 func fail(err error) Result { return Result{Lines: []Line{errLine(err)}} }
 
 func (s *Shell) exec(line string) Result {
+	line = s.lineRefs(line)
 	w := strings.Fields(line)
 	if len(w) == 0 {
 		return Result{}
@@ -71,26 +72,32 @@ func (s *Shell) exec(line string) Result {
 		if len(args) < 3 {
 			return usage("msg <node> <user> <text>")
 		}
-		if err := s.be.SendMessage(args[0], args[1], restAfter(line, 3)); err != nil {
-			return fail(err)
+		what := "message to " + strings.ToUpper(args[0]) + "/" + strings.ToUpper(args[1])
+		m := s.startMark()
+		if err := s.be.SendMessageNotify(args[0], args[1], restAfter(line, 3), s.notify(m, what)); err != nil {
+			return s.markFail(m, err)
 		}
-		return Result{Lines: []Line{ok("message sent to " + strings.ToUpper(args[0]) + "/" + strings.ToUpper(args[1]))}}
+		return s.sentResult(m, what+" queued", ok("message sent to "+strings.ToUpper(args[0])+"/"+strings.ToUpper(args[1])))
 	case "cmd", "c":
 		if len(args) < 2 {
 			return usage("cmd <node> <command>")
 		}
-		if err := s.be.SendCommand(args[0], restAfter(line, 2)); err != nil {
-			return fail(err)
+		what := "command to " + strings.ToUpper(args[0])
+		m := s.startMark()
+		if err := s.be.SendCommandNotify(args[0], restAfter(line, 2), s.notify(m, what)); err != nil {
+			return s.markFail(m, err)
 		}
-		return Result{Lines: []Line{ok("command sent to " + strings.ToUpper(args[0]) +
-			"; responses will appear in the events pane")}}
+		return s.sentResult(m, what+" queued", ok("command sent to "+strings.ToUpper(args[0])+
+			"; responses will appear in the messages pane"))
 	case "send":
 		if len(args) < 3 {
 			return usage("send <node> <user> <file>")
 		}
-		f, err := s.be.SendFile(args[0], args[1], restAfter(line, 3))
+		what := "file " + restAfter(line, 3) + " for " + strings.ToUpper(args[0]) + "/" + strings.ToUpper(args[1])
+		m := s.startMark()
+		f, err := s.be.SendFileNotify(args[0], args[1], restAfter(line, 3), s.notify(m, what))
 		if err != nil {
-			return fail(err)
+			return s.markFail(m, err)
 		}
 		kind := "text"
 		if f.Binary {
@@ -99,7 +106,7 @@ func (s *Shell) exec(line string) Result {
 		l := SegLine(Seg{f.Name, BoldGreen}, Seg{" queued for ", Green}, Seg{f.ToNode + "/" + f.ToUser, Bold},
 			Seg{fmt.Sprintf(" (%d records, %s)", len(f.Records), kind), Green})
 		l.Color = Green
-		return Result{Lines: []Line{l}}
+		return s.sentResult(m, fmt.Sprintf("%s queued (%d records, %s)", what, len(f.Records), kind), l)
 	case "spool", "sp":
 		return s.spoolCmd(args)
 	case "ls":
@@ -185,7 +192,7 @@ func stateColor(st node.State) Color {
 }
 
 func (s *Shell) statusLines() []Line {
-	out := []Line{{Text: fmt.Sprintf("%-8s %-10s %-22s %-8s %s", "NODE", "STATE", "ADDRESS", "SINCE", "INFO"), Color: Bold}}
+	out := []Line{{Text: fmt.Sprintf("%-4s %-8s %-10s %-22s %-8s %s", "LINE", "NODE", "STATE", "ADDRESS", "SINCE", "INFO"), Color: Bold, Clip: true}}
 	for _, st := range s.be.Status() {
 		since, info := "", ""
 		infoColor := Default
@@ -207,9 +214,13 @@ func (s *Shell) statusLines() []Line {
 		if addr == "" {
 			addr = "(passive)"
 		}
-		l := SegLine(Seg{fmt.Sprintf("%-8s ", st.Name), BoldCyan}, Seg{fmt.Sprintf("%-10s ", st.State), stateColor(st.State)},
+		if st.NatOut != "" || st.NatIn != "" {
+			info += fmt.Sprintf(" nat %s/%s", orDash(st.NatIn), orDash(st.NatOut))
+		}
+		l := SegLine(Seg{fmt.Sprintf("%-4d ", st.Line), Dim}, Seg{fmt.Sprintf("%-8s ", st.Name), BoldCyan}, Seg{fmt.Sprintf("%-10s ", st.State), stateColor(st.State)},
 			Seg{fmt.Sprintf("%-22s ", addr), Default}, Seg{fmt.Sprintf("%-8s ", since), Dim}, Seg{info, infoColor})
 		l.Color = stateColor(st.State)
+		l.Clip = true // a table row never wraps: the INFO column is cut with "…"
 		out = append(out, l)
 		if st.LastErr != "" && st.State != node.Up {
 			out = append(out, Line{Text: "  last error: " + st.LastErr, Color: Dim, Cont: "    "})
@@ -227,7 +238,8 @@ func listDir(dir string) []Line {
 	var names []string
 	for _, e := range ents {
 		// Hide received-file sidecars and partial writes.
-		if !e.IsDir() && !strings.HasSuffix(e.Name(), ".meta") && !strings.HasSuffix(e.Name(), ".part") {
+		// Also hide dot files (.spoolseq, editor temp files).
+		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && !strings.HasSuffix(e.Name(), ".meta") && !strings.HasSuffix(e.Name(), ".part") {
 			names = append(names, e.Name())
 		}
 	}
@@ -408,6 +420,13 @@ func applyLinkOpts(rc *config.Remote, words []string) error {
 			rc.Password, err = config.Password(v)
 		case "strict_bcb":
 			rc.StrictBCB, err = config.Bool(v)
+		case "natin":
+			rc.NatIn, err = optIPv4(v)
+		case "natout":
+			rc.NatOut, err = optIPv4(v)
+		case "line":
+			rc.Line, err = config.LineNumber(v)
+			rc.LineSet = err == nil
 		case "buffersize":
 			rc.BufSize, err = config.BufSize(v)
 		case "max_streams", "max-streams":
@@ -438,7 +457,7 @@ func (s *Shell) linkCmd(args []string) Result {
 		return Result{Lines: s.statusLines()}
 	case "define":
 		if len(args) < 3 {
-			return usage("link define <node> <addr|-> [port=<n>] [keepalive=<s>] [password=<pw>] [strict_bcb=yes|no] [save]")
+			return usage("link define <node> <addr|-> [port=<n>] [keepalive=<s>] [password=<pw>] [strict_bcb=yes|no] [turn=free|strict] [max_streams=<n>] [buffersize=<n>] [natin=<ip>] [natout=<ip>] [line=<n>] [save]")
 		}
 		rc := config.Remote{Name: args[1], Port: 175, Keepalive: 10}
 		if err := applyLinkOpts(&rc, args[2:]); err != nil {
@@ -455,7 +474,7 @@ func (s *Shell) linkCmd(args []string) Result {
 		return Result{Lines: out}
 	case "change":
 		if len(args) < 3 {
-			return usage("link change <node> [addr|-] [port=<n>] [keepalive=<s>] [password=<pw>] [strict_bcb=yes|no] [save]")
+			return usage("link change <node> [addr|-] [port=<n>] [keepalive=<s>] [password=<pw>] [strict_bcb=yes|no] [turn=free|strict] [max_streams=<n>] [buffersize=<n>] [natin=<ip>] [natout=<ip>] [line=<n>] [save]")
 		}
 		rc, err := s.be.RemoteConfig(args[1])
 		if err != nil {
@@ -575,16 +594,21 @@ func (s *Shell) routeLines() []Line {
 		state[st.Name] = st.State
 		order = append(order, st.Name)
 	}
-	cols := []*statsColumn{{head: "NODE"}, {head: "PATH"}, {head: "ALT", prio: 2}, {head: "STATE", prio: 1}}
+	lineOf := map[string]string{}
+	for _, st := range s.be.Status() {
+		lineOf[st.Name] = strconv.Itoa(st.Line)
+	}
+	cols := []*statsColumn{{head: "LINE"}, {head: "NODE"}, {head: "PATH"}, {head: "ALT", prio: 2}, {head: "STATE", prio: 1}}
 	var states []node.State
-	addRow := func(name, path, alt string, st node.State) {
-		for i, c := range []string{name, path, alt, st.String()} {
+	// LINE is the line of the link the row's traffic uses.
+	addRow := func(name, path, alt string, st node.State, via string) {
+		for i, c := range []string{lineOf[via], name, path, alt, st.String()} {
 			cols[i].cells = append(cols[i].cells, c)
 		}
 		states = append(states, st)
 	}
 	for _, n := range order {
-		addRow(n, "direct", "", state[n])
+		addRow(n, "direct", "", state[n], n)
 	}
 	var def *node.RouteStatus
 	for _, r := range s.be.Routes() {
@@ -597,10 +621,10 @@ func (s *Shell) routeLines() []Line {
 		if used == "" {
 			used = r.Via // none up: show the via link's state
 		}
-		addRow(r.Dest, "via "+r.Via, r.Alt, state[used])
+		addRow(r.Dest, "via "+r.Via, r.Alt, state[used], used)
 	}
 	if def != nil {
-		addRow("*", "default via "+def.Via, "", state[def.Via])
+		addRow("*", "default via "+def.Via, "", state[def.Via], def.Via)
 	}
 	if len(states) == 0 {
 		return []Line{{Text: "no links or routes", Color: Dim}}
@@ -617,4 +641,128 @@ func (s *Shell) routeLines() []Line {
 		}
 		return Default
 	})
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// nodeTaking lists the commands whose node arguments may be given as a
+// LINE number, and how many leading arguments are node positions
+// (-1 = every word; msg/cmd/send only the first, the rest is free text).
+var nodeTaking = map[string]int{
+	"connect": -1, "drop": -1, "drain": -1, "stats": -1, "link": -1, "route": -1,
+	"msg": 1, "m": 1, "cmd": 1, "c": 1, "send": 1,
+}
+
+// lineRefs rewrites LINE references in node positions to node names:
+// "line <n>" (two words), "l<n>" and a bare "<n>" when no node of that
+// name exists. msg/cmd/send keep their free text untouched.
+func (s *Shell) lineRefs(line string) string {
+	w := strings.Fields(line)
+	if len(w) < 2 {
+		return line
+	}
+	n, ok := nodeTaking[strings.ToLower(w[0])]
+	if !ok {
+		return line
+	}
+	byLine := map[string]string{}
+	names := map[string]bool{}
+	for _, st := range s.be.Status() {
+		byLine[strconv.Itoa(st.Line)] = st.Name
+		names[st.Name] = true
+	}
+	resolve := func(word string) (string, bool) {
+		u := strings.ToUpper(word)
+		if names[u] {
+			return word, false
+		}
+		num := strings.TrimPrefix(u, "L")
+		if name, ok := byLine[num]; ok && num != "" && strings.Trim(num, "0123456789") == "" {
+			return name, true
+		}
+		return word, false
+	}
+	if n == 1 {
+		// Only the first argument (the target); keep the text as typed.
+		if strings.EqualFold(w[1], "line") && len(w) > 2 {
+			if name, ok := byLine[w[2]]; ok {
+				return w[0] + " " + name + rest(line, 3)
+			}
+			return line
+		}
+		if name, ok := resolve(w[1]); ok {
+			return w[0] + " " + name + rest(line, 2)
+		}
+		return line
+	}
+	// Every word is a candidate, except sub-command keywords and option
+	// values (they contain '=' or are words like "to"/"alt").
+	var out []string
+	out = append(out, w[0])
+	for i := 1; i < len(w); i++ {
+		if strings.EqualFold(w[i], "line") && i+1 < len(w) {
+			if name, ok := byLine[w[i+1]]; ok {
+				out = append(out, name)
+				i++
+				continue
+			}
+		}
+		word := w[i]
+		if !strings.Contains(word, "=") {
+			if name, ok := resolve(word); ok && !(i == 1 && (w[0] == "stats" || w[0] == "link" || w[0] == "route") && isSubcommand(word)) {
+				word = name
+			}
+		}
+		out = append(out, word)
+	}
+	return strings.Join(out, " ")
+}
+
+// rest returns line from its n-th word on, with the leading blank, or "".
+func rest(line string, n int) string {
+	r := restAfter(line, n)
+	if r == "" {
+		return ""
+	}
+	return " " + r
+}
+
+func isSubcommand(w string) bool {
+	switch strings.ToLower(w) {
+	case "reset", "define", "change", "delete", "list", "default", "to", "alt":
+		return true
+	}
+	return false
+}
+
+// optIPv4 validates a NAT address; an empty value clears it.
+func optIPv4(v string) (string, error) {
+	if v == "" || v == "-" {
+		return "", nil
+	}
+	return config.IPv4(v)
+}
+
+// markFail marks the echoed line ✗ and returns the error result.
+func (s *Shell) markFail(m *sendMark, err error) Result {
+	if m != nil {
+		m.state = markFail
+	}
+	return fail(err)
+}
+
+// sentResult is the result of a send that was accepted: no line when the
+// echoed command line carries the status mark (it is logged), else (Exec
+// called from code, no echo) the classic confirmation line.
+func (s *Shell) sentResult(m *sendMark, logText string, classic Line) Result {
+	if m == nil {
+		return Result{Lines: []Line{classic}}
+	}
+	s.set.Log.Info("shell: " + logText)
+	return Result{}
 }

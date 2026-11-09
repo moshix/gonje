@@ -34,23 +34,26 @@ func fillShell(t *testing.T, unicode bool) *Shell {
 }
 
 // borderRows lists the row indexes that must hold frame borders for the
-// shell's current layout: top border, divider (split), outer bottom,
-// messages box top and bottom.
+// shell's current layout, top to bottom: title line, events box (split),
+// messages box, command box (whose bottom border is the last row).
 func borderRows(s *Shell, rows int) map[int]bool {
 	l := s.layoutFor(rows, s.cols)
 	b := map[int]bool{0: true}
-	r := 0
-	if s.split {
-		r = l.top + 1 // divider after the command pane
-		b[r] = true
-		r += l.bottom + 1
-	} else {
-		r = l.mixed + 2
+	r := 1
+	box := func(n int) { // a box with n content rows starting at r
+		b[r], b[r+n+1] = true, true
+		r += n + 2
 	}
-	b[r] = true // outer bottom border
+	if s.split {
+		box(l.bottom)
+	}
 	if l.msg > 0 {
-		b[r+1] = true
-		b[r+2+l.msg] = true
+		box(l.msg)
+	}
+	if s.split {
+		box(l.top)
+	} else {
+		box(l.mixed + 1)
 	}
 	return b
 }
@@ -76,8 +79,8 @@ func checkFrame(t *testing.T, s *Shell, f Frame, rows, w int) {
 		rs := []rune(r.Text)
 		first, last := string(rs[0]), string(rs[len(rs)-1])
 		if borders[i] {
-			okL := first == b.TL || first == b.BL || first == b.LT
-			okR := last == b.TR || last == b.BR || last == b.RT
+			okL := first == b.TL || first == b.BL || (i == 0 && first == b.H)
+			okR := last == b.TR || last == b.BR || (i == 0 && last == b.H)
 			if !okL || !okR || string(rs[1]) != b.H {
 				t.Fatalf("row %d should be a border: %q", i, r.Text)
 			}
@@ -109,9 +112,10 @@ func TestRenderFramedSizes(t *testing.T) {
 	}
 }
 
-// TestRenderMessagesPane: messages get their own white-framed pane at
-// the bottom, are not duplicated in the events pane, and the status
-// hints sit in its bottom border.
+// TestRenderMessagesPane: messages get their own white-framed pane in
+// the middle (below the events, above the command box), are not
+// duplicated in the events pane, and the status hints sit in the
+// bottom border of the command box.
 func TestRenderMessagesPane(t *testing.T) {
 	s := fillShell(t, true)
 	f := s.Render(30, 80)
@@ -119,7 +123,10 @@ func TestRenderMessagesPane(t *testing.T) {
 	if l.msg != 6 {
 		t.Fatalf("messages pane %d rows, want 6", l.msg)
 	}
-	top := f.Rows[30-l.msg-2]
+	top := f.Rows[l.bottom+3] // title line + events box
+	if cmd := f.Rows[l.bottom+3+l.msg+2].Text; !strings.HasPrefix(cmd, "┌─ ▲▼ commands") {
+		t.Fatalf("command box below the messages: %q", cmd)
+	}
 	if !strings.HasPrefix(top.Text, "┌─ messages · 60") || top.Segs[0].Color != BrightWhite {
 		t.Fatalf("messages title %q %+v", top.Text, top.Segs[0])
 	}
@@ -131,8 +138,8 @@ func TestRenderMessagesPane(t *testing.T) {
 			t.Fatal("message duplicated in the events pane")
 		}
 	}
-	if !strings.Contains(f.Rows[28].Text, "what is up?") {
-		t.Fatalf("last message row %q", f.Rows[28].Text)
+	if r := f.Rows[l.bottom+3+l.msg].Text; !strings.Contains(r, "what is up?") {
+		t.Fatalf("last message row %q", r)
 	}
 	// No colors: no escape codes at all, white frame included.
 	if strings.Contains(renderPad(top, 79, false), "\x1b") || !strings.Contains(renderPad(top, 79, true), "\x1b[1;97m") {
@@ -187,8 +194,14 @@ func TestMessageBell(t *testing.T) {
 func TestRenderTitlesAndHints(t *testing.T) {
 	s := fillShell(t, true)
 	f := s.Render(30, 100)
-	if !strings.HasPrefix(f.Rows[0].Text, "┌─ gonje 9.9 · NODEA · 1/2 links up · ▲▼ commands ─") {
+	if !strings.HasPrefix(f.Rows[0].Text, "── gonje 9.9 · NODEA · 1/2 links up ──") {
 		t.Fatalf("title %q", f.Rows[0].Text)
+	}
+	if !strings.HasPrefix(f.Rows[1].Text, "┌─ incoming") {
+		t.Fatalf("events box not at the top: %q", f.Rows[1].Text)
+	}
+	if c := cmdRow(f); !strings.HasPrefix(c, "┌─ ▲▼ commands ─") {
+		t.Fatalf("command box title %q", c)
 	}
 	div := dividerRow(f, s.box)
 	if !strings.Contains(div, "incoming · L3 · live · 60 events") || strings.Contains(div, "▲▼") {
@@ -200,15 +213,25 @@ func TestRenderTitlesAndHints(t *testing.T) {
 	s.split = false
 	s.Scroll(-1)
 	f = s.Render(30, 100)
-	last := f.Rows[29].Text
-	if strings.Contains(last, "resize") || !strings.Contains(last, "↑ ") {
+	if last := f.Rows[29].Text; strings.Contains(last, "resize") {
 		t.Fatalf("single-pane status bar %q", last)
+	}
+	if c := cmdRow(f); !strings.Contains(c, "commands · ↑ ") {
+		t.Fatalf("single-pane scroll hint %q", c)
 	}
 }
 
+// dividerRow returns the events box title row.
 func dividerRow(f Frame, b Box) string {
+	return rowWith(f, b.TL, "incoming")
+}
+
+// cmdRow returns the command box title row.
+func cmdRow(f Frame) string { return rowWith(f, "", "commands") }
+
+func rowWith(f Frame, prefix, text string) string {
 	for _, r := range f.Rows[1 : len(f.Rows)-1] {
-		if strings.HasPrefix(r.Text, b.LT) {
+		if strings.HasPrefix(r.Text, prefix) && strings.Contains(r.Text, text) {
 			return r.Text
 		}
 	}
@@ -228,8 +251,8 @@ func TestFocusAndScroll(t *testing.T) {
 	if s.results.Scroll() == 0 || s.events.Scroll() != 0 || s.msgs.Scroll() != 0 {
 		t.Fatal("ctrl-u on commands")
 	}
-	if f := s.Render(40, 100); !strings.Contains(f.Rows[0].Text, "▲▼ commands · ↑ ") {
-		t.Fatalf("title while scrolled %q", f.Rows[0].Text)
+	if c := cmdRow(s.Render(40, 100)); !strings.Contains(c, "▲▼ commands · ↑ ") {
+		t.Fatalf("title while scrolled %q", c)
 	}
 	s.Scroll(1)
 	s.ToggleFocus() // events
@@ -300,7 +323,7 @@ func TestEventCountMatchesRows(t *testing.T) {
 			t.Fatalf("L%d divider %q", level, div)
 		}
 		l := s.layoutFor(30, 100)
-		start := l.top + 2
+		start := 2 // title line, events box top border
 		drawn := 0
 		for _, r := range f.Rows[start : start+l.bottom] {
 			if strings.TrimSpace(strings.Trim(r.Text, "│")) != "" {
@@ -348,18 +371,18 @@ func TestRenderTiny(t *testing.T) {
 
 func TestResizePanes(t *testing.T) {
 	s := fillShell(t, true)
-	s.Render(30, 100) // 30 - 8 (messages box) - 3 = 19 inner rows, 40% -> 7
-	inner := 19
+	s.Render(30, 100) // 30 - 8 (messages box) - 5 = 17 inner rows, 40% -> 6
+	inner := 17
 	_, b := s.paneHeights(inner)
-	if b != 7 {
+	if b != 6 {
 		t.Fatalf("initial events pane %d", b)
 	}
 	s.Resize(1)
-	if _, b = s.paneHeights(inner); b != 8 {
+	if _, b = s.paneHeights(inner); b != 7 {
 		t.Fatalf("grow -> %d", b)
 	}
 	f := s.Render(30, 100)
-	if !strings.Contains(joinText(f.Rows), "events 8 lines") {
+	if !strings.Contains(joinText(f.Rows), "events 7 lines") {
 		t.Fatal("size note not shown")
 	}
 	for i := 0; i < 50; i++ {
@@ -515,4 +538,50 @@ func TestMessageBlink(t *testing.T) {
 	}
 	// The blinking pane still keeps its frame (border-row check with messages).
 	checkFrame(t, s, s.Render(30, 100), 30, 99)
+}
+
+// TestTablesNeverWrap: table rows (nodes / link list, routes, stats) are
+// clipped with "…" instead of wrapping, at any pane width, and the
+// rendered pane rows never cross the frame.
+func TestTablesNeverWrap(t *testing.T) {
+	clipped := 0
+	for _, cols := range []int{30, 45, 60, 80, 100} {
+		s := fillShell(t, true)
+		s.Render(40, cols)
+		for _, cmd := range []string{"nodes", "link list", "routes", "stats"} {
+			for _, l := range s.Exec(cmd).Lines {
+				if !l.Clip {
+					continue
+				}
+				rows := wrapLine(l, s.width)
+				if len(rows) != 1 || Width(rows[0].Text) > s.width {
+					t.Fatalf("%s at %d cols wrapped: %q", cmd, cols, l.Text)
+				}
+				if Width(l.Text) > s.width {
+					clipped++
+				}
+				if Width(l.Text) > s.width && !strings.HasSuffix(rows[0].Text, "…") {
+					t.Fatalf("%s at %d cols: clipped row without …: %q", cmd, cols, rows[0].Text)
+				}
+			}
+		}
+		// The status table of fillShell's backend: every row clipped.
+		for _, l := range s.statusLines() {
+			if strings.HasPrefix(l.Text, "  last error") {
+				continue
+			}
+			if !l.Clip {
+				t.Fatalf("status row not clipped: %q", l.Text)
+			}
+		}
+		checkFrame(t, s, s.Render(40, cols), 40, usableWidth(cols))
+	}
+	if clipped == 0 {
+		t.Fatal("no table row was wide enough to be clipped")
+	}
+	// clipLine keeps the colors of what fits.
+	l := clipLine(SegLine(Seg{"abcdef", Red}, Seg{"ghij", Green}), 8)
+	if l.Text != "abcdefg…" || l.Segs[0].Color != Red || l.Segs[len(l.Segs)-1].Color != Green {
+		t.Fatalf("clipLine %q %+v", l.Text, l.Segs)
+	}
 }

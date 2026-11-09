@@ -23,13 +23,20 @@ const idleSummaryEvery = time.Minute
 // SendNMR queues an NMR for transmission on our next turn. It fails if
 // the session ended. NMRs still queued when the session ends are
 // reported as undelivered (EvError), never silently dropped.
-func (s *Session) SendNMR(m *records.NMR) error {
+func (s *Session) SendNMR(m *records.NMR) error { return s.SendNMRNotify(m, nil) }
+
+// SendNMRNotify queues an NMR like SendNMR; done (if not nil) is called
+// once, from the session goroutine, when the NMR has been written to the
+// connection (nil) or when the session ends before that (error). done
+// must not block.
+func (s *Session) SendNMRNotify(m *records.NMR, done func(error)) error {
 	s.nmrMu.Lock()
 	if s.nmrClosed {
 		s.nmrMu.Unlock()
 		return ErrClosed
 	}
 	s.nmrPending = append(s.nmrPending, m)
+	s.nmrDone = append(s.nmrDone, done)
 	s.nmrMu.Unlock()
 	s.Kick()
 	return nil
@@ -148,10 +155,19 @@ func (s *Session) Run() (err error) {
 		}
 	}()
 	// TCP keepalive finds a dead peer even when the link is idle and the
-	// peer sends nothing (free mode does not time out on silence).
+	// peer sends nothing (free mode does not time out on silence): first
+	// probe after one keepalive interval, given up after 3 more.
+	// Keepalive probes are suspended while sent data is unacknowledged,
+	// and free mode sends a null buffer every interval, so against a
+	// vanished peer only the retransmission timeout would end the link
+	// (about 15 minutes on Linux). setUserTimeout caps that at three
+	// intervals where the system supports it (Linux TCP_USER_TIMEOUT).
 	if tc, ok := s.conn.(*net.TCPConn); ok {
-		_ = tc.SetKeepAlive(true)
-		_ = tc.SetKeepAlivePeriod(s.p.Keepalive)
+		k := s.p.Keepalive
+		_ = tc.SetKeepAliveConfig(net.KeepAliveConfig{Enable: true, Idle: k, Interval: k, Count: 3})
+		if err := setUserTimeout(tc, 3*k+5*time.Second); err != nil {
+			s.log.Debug("TCP user timeout not set: " + err.Error())
+		}
 	}
 	go s.reader()
 	ticker := time.NewTicker(tickInterval)
@@ -225,8 +241,14 @@ func (s *Session) finish(err error) {
 		s.nmrMu.Lock()
 		s.nmrClosed = true
 		lost := s.nmrPending
-		s.nmrPending = nil
+		dones := append(s.nmrSent, s.nmrDone...)
+		s.nmrPending, s.nmrDone, s.nmrSent = nil, nil, nil
 		s.nmrMu.Unlock()
+		for _, done := range dones {
+			if done != nil {
+				done(fmt.Errorf("not delivered (link down): %v", err))
+			}
+		}
 		for _, m := range lost {
 			what := "message to " + m.OutUser()
 			if m.IsCommand() {
@@ -413,6 +435,8 @@ func (s *Session) takeNMRs() []records.Record {
 		recs, size = append(recs, r), size+n
 		cmd := s.nmrPending[0].IsCommand()
 		s.nmrPending = s.nmrPending[1:]
+		s.nmrSent = append(s.nmrSent, s.nmrDone[0])
+		s.nmrDone = s.nmrDone[1:]
 		s.count(func(st *Stats) {
 			if cmd {
 				st.CmdsOut++

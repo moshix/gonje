@@ -29,6 +29,9 @@ type LinkCounters struct {
 	RspsOut      int
 	BufSize      int // buffer size we advertise
 	MaxStreams   int // concurrent transfers each way
+	Line         int
+	NatIn        string
+	NatOut       string
 }
 
 // Counters is the node-wide "stats" snapshot.
@@ -51,7 +54,7 @@ func (n *Node) Counters() Counters {
 		lc := LinkCounters{Name: name, State: r.visibleState(), Held: r.held, LastErr: r.lastErr,
 			Connected: r.connected, Connects: r.connects, Failures: r.failures,
 			Total: r.totals, RspsIn: r.rspIn, RspsOut: r.rspOut, BufSize: bufOrDefault(r.cfg.BufSize),
-			MaxStreams: max(r.cfg.MaxStreams, 1)}
+			MaxStreams: max(r.cfg.MaxStreams, 1), Line: r.cfg.Line, NatIn: r.cfg.NatIn, NatOut: r.cfg.NatOut}
 		if r.cfg.Addr != "" {
 			lc.Addr = net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
 		}

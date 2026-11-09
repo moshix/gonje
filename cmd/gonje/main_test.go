@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -160,8 +161,11 @@ func TestBatchEndToEnd(t *testing.T) {
 		t.Fatalf("send output:\n%s", out.String())
 	}
 	waitFor(t, bev, link.EvFileIn, "BLOB")
-	ents, _ := os.ReadDir(recv)
-	got, _ := os.ReadFile(filepath.Join(recv, ents[0].Name()))
+	bins, _ := filepath.Glob(filepath.Join(recv, "*.bin"))
+	if len(bins) != 1 {
+		t.Fatalf("received %v", bins)
+	}
+	got, _ := os.ReadFile(bins[0])
 	if !bytes.Equal(got, data) {
 		t.Fatal("file not byte-exact")
 	}
@@ -317,5 +321,42 @@ func TestBatchPeerDialsUs(t *testing.T) {
 		if !strings.Contains(out.String(), "gonje: connected to NODEB") {
 			t.Fatalf("%s: %s", name, out.String())
 		}
+	}
+}
+
+// TestBatchInterrupted: SIGINT/SIGTERM during a batch job says
+// "interrupted" and exits 3 (second review m4).
+func TestBatchInterrupted(t *testing.T) {
+	fake := make(chan os.Signal, 1)
+	old := batchSignals
+	batchSignals = func() (<-chan os.Signal, func()) { return fake, func() {} }
+	defer func() { batchSignals = old }()
+	dead := batchCfg(t, "127.0.0.1:1")
+	j := job("msg", "NODEB", "U", "x")
+	j.setup = 20 * time.Second
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		fake <- syscall.SIGINT
+	}()
+	var out bytes.Buffer
+	start := time.Now()
+	rc := runBatch(j, dead, logx.Discard(), &out, node.Options{User: "ALICE"})
+	if rc != exitInterrupted || !strings.Contains(out.String(), "gonje: interrupted") || time.Since(start) > 10*time.Second {
+		t.Fatalf("rc %d:\n%s", rc, out.String())
+	}
+}
+
+// TestBatchCountsOnlyResponses: an unsolicited message from the node is
+// shown but does not count as a command response (second review m5).
+func TestBatchCountsOnlyResponses(t *testing.T) {
+	var out bytes.Buffer
+	b := &batch{j: &batchJob{node: "NODEB"}, out: &out, log: logx.Discard()}
+	b.show(link.Event{Kind: link.EvMsgIn, Node: "NODEB", Text: "Signon of link NODEA complete"})
+	if b.got != 0 || !strings.Contains(out.String(), "Signon of link") {
+		t.Fatalf("message counted: %d\n%s", b.got, out.String())
+	}
+	b.show(link.Event{Kind: link.EvRspIn, Node: "NODEB", Text: "from NODEB: answer"})
+	if b.got != 1 {
+		t.Fatal("response not counted")
 	}
 }

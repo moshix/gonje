@@ -201,6 +201,7 @@ type fakeBackend struct {
 	local     node.LocalInfo
 	remotes   map[string]config.Remote
 	lastRoute config.Route
+	dones     []func(error) // send callbacks, fired by the tests
 }
 
 func (f *fakeBackend) rec(s string) error {
@@ -215,7 +216,7 @@ func (f *fakeBackend) Status() []node.LinkStatus {
 	return []node.LinkStatus{
 		{Name: "NODEB", Addr: "127.0.0.1:2175", State: node.Up, Since: time.Now(),
 			Stats: link.Stats{Primary: true, MsgsIn: 1}},
-		{Name: "NODEC", State: node.Down, Held: true, Queued: 2, LastErr: strings.Repeat("e", 120)},
+		{Name: "NODEC", Line: 1, State: node.Down, Held: true, Queued: 2, LastErr: strings.Repeat("e", 120)},
 	}
 }
 func (f *fakeBackend) Local() node.LocalInfo { return f.local }
@@ -228,11 +229,16 @@ func (f *fakeBackend) Drop(n string) error    { return f.rec("drop " + n) }
 func (f *fakeBackend) Drain(n string) (string, error) {
 	return n + " draining: waiting for 1 inbound, 0 outbound transfer(s)", f.rec("drain " + n)
 }
-func (f *fakeBackend) SendCommand(n, c string) error { return f.rec("cmd " + n + "|" + c) }
-func (f *fakeBackend) SendMessage(n, u, t string) error {
+func (f *fakeBackend) SendCommandNotify(n, c string, done func(error)) error {
+	f.dones = append(f.dones, done)
+	return f.rec("cmd " + n + "|" + c)
+}
+func (f *fakeBackend) SendMessageNotify(n, u, t string, done func(error)) error {
+	f.dones = append(f.dones, done)
 	return f.rec("msg " + n + "|" + u + "|" + t)
 }
-func (f *fakeBackend) SendFile(n, u, p string) (*link.OutboundFile, error) {
+func (f *fakeBackend) SendFileNotify(n, u, p string, done func(error)) (*link.OutboundFile, error) {
+	f.dones = append(f.dones, done)
 	if err := f.rec("send " + n + "|" + u + "|" + p); err != nil {
 		return nil, err
 	}
@@ -373,10 +379,10 @@ func TestExecCommands(t *testing.T) {
 func TestStatusColors(t *testing.T) {
 	s, _ := newTestShell(t)
 	lines := s.Exec("nodes").Lines
-	if lines[1].Segs[1].Color != BoldGreen || !strings.HasPrefix(lines[1].Segs[1].Text, "UP") {
+	if lines[1].Segs[2].Color != BoldGreen || !strings.HasPrefix(lines[1].Segs[2].Text, "UP") {
 		t.Fatalf("UP not green: %+v", lines[1].Segs)
 	}
-	if lines[2].Segs[1].Color != Red || lines[2].Segs[4].Text != "held q=2" || lines[2].Segs[4].Color != Dim {
+	if lines[2].Segs[2].Color != Red || lines[2].Segs[5].Text != "held q=2" || lines[2].Segs[5].Color != Dim {
 		t.Fatalf("DOWN/held: %+v", lines[2].Segs)
 	}
 	if stateColor(node.Connecting) != Yellow || stateColor(node.Accepting) != Yellow {

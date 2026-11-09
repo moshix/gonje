@@ -37,7 +37,7 @@ func TestGolden(t *testing.T) {
 	if len(f.Records) != 1 {
 		t.Fatalf("%d records", len(f.Records))
 	}
-	recs := StripSequenceNumbers(f.Records)
+	recs, _ := StripSequenceNumbers(f.Records)
 	if got := strings.TrimRight(ebcdic.Decode(recs[0]), " "); got != "THIS IS A TEXT FILE" {
 		t.Fatalf("%q", got)
 	}
@@ -137,7 +137,7 @@ func TestSpanningAndMultiRecord(t *testing.T) {
 		t.Fatalf("%d records %q", len(f.Records), f.DSName)
 	}
 	// No sequence numbers here: nothing is stripped.
-	if len(StripSequenceNumbers(f.Records)[0]) != 80 {
+	if recs, _ := StripSequenceNumbers(f.Records); len(recs[0]) != 80 {
 		t.Fatal("stripped columns that were not numbers")
 	}
 }
@@ -180,7 +180,7 @@ func FuzzParse(f *testing.F) {
 	f.Add(build("PS", "INMCOPY", 0x9000, 80, [][]byte{ebcdic.Field("X", 80)}, 30))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if nf, err := Parse(b); err == nil {
-			_ = StripSequenceNumbers(nf.Records)
+			_, _ = StripSequenceNumbers(nf.Records)
 			_ = RecfmName(nf.RECFM)
 			_ = nf.PDS()
 		}

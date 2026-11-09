@@ -64,6 +64,10 @@ func (s *Shell) runPlain(in io.Reader, out io.Writer, events <-chan link.Event, 
 			if res.Quit {
 				return nil
 			}
+		case <-s.Wake():
+			// A send finished on a link goroutine: print its error.
+			_, errs := s.ApplyMarks()
+			put(errs)
 		case ev := <-events:
 			if s.HandleEvent(ev) {
 				// Print what was just added (keepalives collapse on
@@ -152,21 +156,33 @@ func (s *Shell) runTTY(in, out *os.File, events <-chan link.Event, done <-chan s
 				return nil
 			}
 			for _, b := range data {
-				// While paging, keys answer the pager (C/Q), not the editor.
-				if s.Paging() {
-					if b == 0x0c {
-						t.w.WriteString(clearScreen)
-					}
-					s.PagerKey(b)
-					continue
-				}
 				for _, k := range dec.Feed(b) {
+					// While paging, keys answer the pager (C/Q), not
+					// the editor.
+					if s.Paging() {
+						if k.Code == KeyCtrl && k.Rune == 'l' {
+							t.w.WriteString(clearScreen)
+						}
+						s.PagerInput(k)
+						continue
+					}
 					if t.action(s.editor.Key(k)) {
 						return nil
 					}
 				}
 			}
+			// A lone Esc at the end of a read is the Esc key (an escape
+			// sequence arrives in one read): the pager quits on it.
+			if s.Paging() && dec.LoneEscape() {
+				s.PagerInput(Key{Code: KeyEscape})
+			}
 			t.draw()
+		case <-s.Wake():
+			// A send finished on a link goroutine: set its mark.
+			if changed, _ := s.ApplyMarks(); changed {
+				t.dirty = true
+				t.draw()
+			}
 		case ev := <-events:
 			if s.HandleEvent(ev) {
 				t.dirty = true

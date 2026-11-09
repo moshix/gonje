@@ -89,17 +89,45 @@ func (s *Shell) pagerLine() Line {
 	return SegLine(Seg{fmt.Sprintf("-- more (%d%%) -- C continue, Q quit --", s.pagerPercent()), BoldYellow})
 }
 
-// PagerKey handles one key byte while paging: C, c, Space or Enter show
-// the next page; Q, q or Esc stop (the rest is skipped). Other keys are
-// ignored. It returns false when not paging.
+// PagerKey handles one plain key byte while paging (see PagerInput).
 func (s *Shell) PagerKey(b byte) bool {
+	k := Key{Code: KeyRune, Rune: rune(b)}
+	switch b {
+	case 0x1b:
+		k = Key{Code: KeyEscape}
+	case '\r', '\n':
+		k = Key{Code: KeyEnter}
+	}
+	return s.PagerInput(k)
+}
+
+// PagerInput handles one decoded key while paging: C, c, Space, Enter,
+// Down or PgDn show the next page; Q, q or Esc stop (the rest is
+// skipped). Other keys are ignored. The terminal feeds decoded keys, so
+// an arrow key (ESC [ B) is one key, not an Esc that quits followed by
+// "[B" typed into the command line. It returns false when not paging.
+func (s *Shell) PagerInput(k Key) bool {
 	if s.pg == nil {
 		return false
 	}
-	switch b {
-	case 'c', 'C', ' ', '\r', '\n':
+	next, quit := false, false
+	switch k.Code {
+	case KeyRune:
+		switch k.Rune {
+		case 'c', 'C', ' ':
+			next = true
+		case 'q', 'Q':
+			quit = true
+		}
+	case KeyEnter, KeyDown, KeyPgDn:
+		next = true
+	case KeyEscape:
+		quit = true
+	}
+	switch {
+	case next:
 		s.addPage(s.pageRows())
-	case 'q', 'Q', 0x1b:
+	case quit:
 		s.addResult(Line{Text: fmt.Sprintf("(%d more line(s) skipped)", len(s.pg.lines)-s.pg.next), Color: Dim})
 		s.endPager()
 	}
@@ -117,10 +145,19 @@ func (s *Shell) endPager() {
 	}
 }
 
+// maxHeld caps the events held back while the pager waits; older ones
+// are dropped from the screen (they are in the log anyway).
+const maxHeld = 1000
+
 // holdEvent keeps an event back while paging in single-pane mode.
+// Messages and responses are never held: they have their own pane and
+// must blink (and ring) when they arrive.
 func (s *Shell) holdEvent(ev link.Event) bool {
-	if s.pg == nil || s.split {
+	if s.pg == nil || s.split || ev.Kind == link.EvMsgIn || ev.Kind == link.EvRspIn {
 		return false
+	}
+	if len(s.held) >= maxHeld {
+		s.held = s.held[1:]
 	}
 	s.held = append(s.held, ev)
 	return true

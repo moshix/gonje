@@ -94,6 +94,12 @@ type Line struct {
 	// BlinkUntil: the tag segment (Segs[1], "MSG"/"RSP") blinks until
 	// then. Screen only; the log never sees it.
 	BlinkUntil time.Time
+	// Clip: a table row that must never wrap. When it is wider than the
+	// pane it is cut and ends in "…" instead of continuing on a new row.
+	Clip bool
+	// Mark: the send status shown after an echoed command line (… ✓ ✗).
+	// Shared by the copies of the line in the results and mixed panes.
+	Mark *sendMark
 }
 
 // Seg is a colored piece of a Line.
@@ -187,6 +193,10 @@ func Wrap(s string, width int, indent string) []string {
 // segmented line that fits keeps its colors; one that must be wrapped
 // falls back to its base color.
 func wrapLine(l Line, width int) []Line {
+	l = l.Mark.apply(l)
+	if l.Clip && width > 0 {
+		return []Line{clipLine(l, width)}
+	}
 	if len(l.Segs) > 0 && (width <= 0 || Width(l.Text) <= width) {
 		return []Line{l}
 	}
@@ -236,4 +246,30 @@ func paint(text string, c Color, color bool) string {
 		return text
 	}
 	return c.ansi() + text + ansiReset
+}
+
+// clipLine cuts a line that is wider than width to width-1 columns and
+// adds "…", so a table row stays one screen row. The colors of the
+// segments that still fit are kept.
+func clipLine(l Line, width int) Line {
+	if Width(l.Text) <= width {
+		return l
+	}
+	c := l.Color
+	if n := len(l.Segs); n > 0 {
+		c = l.Segs[n-1].Color
+	}
+	if width <= 1 {
+		return Line{Text: Fit("…", width), Color: c, Clip: true}
+	}
+	cut := fitLine(Line{Text: l.Text, Color: l.Color, Segs: l.Segs}, width-1)
+	segs := cut.Segs
+	if len(segs) == 0 {
+		segs = []Seg{{cut.Text, l.Color}}
+	} else {
+		c = segs[len(segs)-1].Color
+	}
+	out := SegLine(append(segs, Seg{"…", c})...)
+	out.Color, out.Clip = l.Color, true
+	return out
 }

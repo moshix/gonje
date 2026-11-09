@@ -177,3 +177,13 @@ func (d *KeyDecoder) feed1(b byte) (Key, bool) {
 	}
 	return Key{Code: KeyNone}, true
 }
+
+// LoneEscape reports (and consumes) a pending ESC that has not been
+// followed by anything yet.
+func (d *KeyDecoder) LoneEscape() bool {
+	if len(d.seq) == 1 && d.seq[0] == 0x1b {
+		d.seq = d.seq[:0]
+		return true
+	}
+	return false
+}

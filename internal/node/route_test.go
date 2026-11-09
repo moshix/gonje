@@ -85,8 +85,23 @@ func TestThreeNodeRouting(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("routed file not byte-exact")
 	}
-	if ents, _ := os.ReadDir(filepath.Join(b.dir, "inbox")); len(ents) != 0 {
-		t.Fatal("intermediate node kept a copy")
+	// The intermediate node keeps no received file; its forward spool
+	// copy goes once C confirmed the file.
+	for _, e := range mustReadDir(t, filepath.Join(b.dir, "inbox")) {
+		if e.Name() != SpoolSeqFile && e.Name() != ForwardDirName {
+			t.Fatalf("intermediate node kept a copy: %s", e.Name())
+		}
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		list, _ := ForwardEntries(filepath.Join(b.dir, "inbox"))
+		if len(list) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("forward spool not cleaned: %+v", list[0])
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	if rs := a.Routes(); len(rs) != 1 || rs[0].Using != "NODEB" {
 		t.Fatalf("routes %+v", rs)
@@ -98,6 +113,7 @@ func routeNode(t *testing.T) *Node {
 	cfg := config.Defaults()
 	cfg.LocalNode = "NODEA"
 	cfg.Remotes = []*config.Remote{{Name: "NODEB", Addr: "h", Port: 1, Keepalive: 5}, {Name: "NODED", Addr: "h", Port: 1, Keepalive: 5}}
+	cfg.RecvDir = t.TempDir()
 	return New(cfg, Options{User: "ALICE", Log: logx.Discard()})
 }
 
@@ -232,4 +248,13 @@ func TestSpoolSidecars(t *testing.T) {
 			t.Errorf("binary meta lacks %q:\n%s", want, bm)
 		}
 	}
+}
+
+func mustReadDir(t *testing.T, dir string) []os.DirEntry {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ents
 }

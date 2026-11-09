@@ -318,3 +318,194 @@ func TestRoutesConfig(t *testing.T) {
 		t.Fatalf("%q", b)
 	}
 }
+
+func TestNatAndLines(t *testing.T) {
+	text := "local_node=A\nremote_host_name=B remote_natin=10.1.1.2 remote_natout=35.192.26.118\n" +
+		"remote_host_name=C remote_line=5\nremote_host_name=D\n"
+	c, err := Parse(strings.NewReader(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, cc, d := c.Remote("B"), c.Remote("C"), c.Remote("D")
+	if b.NatIn != "10.1.1.2" || b.NatOut != "35.192.26.118" {
+		t.Fatalf("%+v", b)
+	}
+	// Defaults in order of appearance from 0, explicit numbers kept.
+	if b.Line != 0 || cc.Line != 5 || !cc.LineSet || d.Line != 1 || d.LineSet {
+		t.Fatalf("lines %d %d %d", b.Line, cc.Line, d.Line)
+	}
+	for _, bad := range []string{
+		"local_node=A remote_host_name=B remote_line=3 remote_host_name=C remote_line=3",
+		"local_node=A remote_host_name=B remote_line=1000",
+		"local_node=A remote_host_name=B remote_natin=10.1.1",
+		"local_node=A remote_host_name=B remote_natout=::1",
+	} {
+		if _, err := Parse(strings.NewReader(bad)); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+	p := writeTemp(t, text, 0o644)
+	f, _ := OpenFile(p)
+	f.SetRemote(&Remote{Name: "D", Port: 175, Keepalive: 10, Line: 9, LineSet: true, NatOut: "1.2.3.4"})
+	f.SetRemote(&Remote{Name: "B", Port: 175, Keepalive: 10, NatIn: "10.1.1.3"}) // natout cleared
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	c = load(t, p)
+	if c.Remote("D").Line != 9 || c.Remote("D").NatOut != "1.2.3.4" || c.Remote("B").NatIn != "10.1.1.3" || c.Remote("B").NatOut != "" {
+		t.Fatalf("%+v %+v", c.Remote("D"), c.Remote("B"))
+	}
+}
+
+// routedSample has top-level keys, comments and routes after and
+// between the remote blocks (the loader accepts them anywhere).
+const routedSample = `local_node=ME
+# first link
+remote_host_name=A
+remote_host_addr=a
+# second link
+remote_host_name=B
+remote_host_addr=b
+remote_keepalive=5
+
+# routes
+route=X,A
+timeout=30
+# third link
+remote_host_name=C
+remote_host_addr=c
+
+# at the end
+default_route=A
+msg_bell=yes
+`
+
+// TestDeleteRemoteKeepsTopLevel: deleting the first, middle or last
+// remote removes only its remote_* lines (and the comments inside the
+// block); routes, top-level keys and their comments all survive.
+func TestDeleteRemoteKeepsTopLevel(t *testing.T) {
+	for _, name := range []string{"A", "B", "C"} {
+		text := routedSample
+		if name == "A" {
+			// The route and default route use A: point them at C.
+			text = strings.ReplaceAll(text, "route=X,A", "route=X,C")
+			text = strings.ReplaceAll(text, "default_route=A", "default_route=C")
+		}
+		p := writeTemp(t, text, 0o644)
+		f, err := OpenFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !f.DeleteRemote(name) {
+			t.Fatalf("%s not found", name)
+		}
+		if err := f.Save(); err != nil {
+			t.Fatalf("delete %s: %v", name, err)
+		}
+		got := string(f.Bytes())
+		for _, keep := range []string{"# routes", "route=X,", "timeout=30", "# at the end", "default_route=", "msg_bell=yes", "local_node=ME"} {
+			if !strings.Contains(got, keep) {
+				t.Fatalf("delete %s lost %q:\n%s", name, keep, got)
+			}
+		}
+		if strings.Contains(got, "remote_host_name="+name) || strings.Contains(got, "remote_host_addr="+strings.ToLower(name)) {
+			t.Fatalf("delete %s left its block:\n%s", name, got)
+		}
+		c := load(t, p)
+		if len(c.Remotes) != 2 || c.Timeout != 30 || !c.MsgBell {
+			t.Fatalf("delete %s: reloaded %+v", name, c)
+		}
+	}
+	// Middle block: its own trailing remote key goes, the comment of the
+	// next block's route section stays.
+	f := &File{lines: strings.Split(strings.TrimSuffix(routedSample, "\n"), "\n")}
+	f.DeleteRemote("B")
+	if got := string(f.Bytes()); strings.Contains(got, "remote_keepalive=5") || strings.Contains(got, "# second link") {
+		t.Fatalf("middle delete:\n%s", got)
+	}
+	// SetRemote on the last block adds its keys inside the block, not
+	// after the top-level keys that follow it.
+	f = &File{lines: strings.Split(strings.TrimSuffix(routedSample, "\n"), "\n")}
+	f.SetRemote(&Remote{Name: "C", Addr: "c", Port: 175, Keepalive: 7})
+	got := string(f.Bytes())
+	if !strings.Contains(got, "remote_host_addr=c\nremote_host_port=175\nremote_keepalive=7\n") {
+		t.Fatalf("set last remote:\n%s", got)
+	}
+}
+
+// TestRouteSharedLine: a route that shares a line with other keys is
+// found, updated and deleted without touching the other keys.
+func TestRouteSharedLine(t *testing.T) {
+	text := "local_node=ME timeout=10 route=X,A, B msg_bell=yes # routes\nremote_host_name=A\nremote_host_addr=a\nremote_host_name=B\nremote_host_addr=b\n"
+	f := &File{lines: strings.Split(strings.TrimSuffix(text, "\n"), "\n")}
+	f.SetRoute(Route{Dest: "X", Via: "B"})
+	if got := f.lines[0]; got != "local_node=ME timeout=10 route=X,B msg_bell=yes # routes" {
+		t.Fatalf("set: %q", got)
+	}
+	if !f.DeleteRoute("x") {
+		t.Fatal("route not found")
+	}
+	if got := f.lines[0]; got != "local_node=ME timeout=10 msg_bell=yes # routes" {
+		t.Fatalf("delete: %q", got)
+	}
+	if f.DeleteRoute("X") {
+		t.Fatal("deleted twice")
+	}
+}
+
+// TestEditCRLF: lines added to a CRLF file get CRLF too.
+func TestEditCRLF(t *testing.T) {
+	p := writeTemp(t, "local_node=ME\r\nremote_host_name=A\r\nremote_host_addr=a\r\n", 0o644)
+	f, err := OpenFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetRemote(&Remote{Name: "A", Addr: "a", Port: 175, Keepalive: 9})
+	f.SetLocal("timeout", "20")
+	f.SetRoute(Route{Dest: "X", Via: "A"})
+	got := string(f.Bytes())
+	if strings.Count(got, "\n") != strings.Count(got, "\r\n") {
+		t.Fatalf("mixed line ends: %q", got)
+	}
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if c := load(t, p); c.Timeout != 20 || c.Remotes[0].Keepalive != 9 || len(c.Routes) != 1 {
+		t.Fatalf("reload %+v", c)
+	}
+}
+
+// TestSetLocalAboveRemoteComment: a new top-level key in a file with
+// only remote blocks goes above the comment that introduces the first
+// remote.
+func TestSetLocalAboveRemoteComment(t *testing.T) {
+	f := &File{lines: []string{"# the A link", "remote_host_name=A", "remote_host_addr=a"}}
+	f.SetLocal("local_node", "ME")
+	if f.lines[0] != "local_node=ME" || f.lines[1] != "# the A link" {
+		t.Fatalf("%q", f.lines)
+	}
+}
+
+// TestSaveThroughSymlink: saving a symlinked config writes the target
+// and keeps the link.
+func TestSaveThroughSymlink(t *testing.T) {
+	target := writeTemp(t, "local_node=ME\n", 0o644)
+	link := filepath.Join(t.TempDir(), "gonje.cnf")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("no symlinks:", err)
+	}
+	f, err := OpenFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetLocal("timeout", "25")
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink replaced by a file")
+	}
+	if c := load(t, target); c.Timeout != 25 {
+		t.Fatal("target not updated")
+	}
+}

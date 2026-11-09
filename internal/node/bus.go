@@ -3,6 +3,7 @@
 package node
 
 import (
+	"fmt"
 	"sync"
 
 	"gonje/internal/logx"
@@ -18,6 +19,8 @@ type Bus struct {
 	next    int
 	log     *logx.Logger
 	Dropped int
+	// lineOf maps a remote name to its LINE number (set by the node).
+	lineOf func(name string) (int, bool)
 }
 
 // NewBus creates a bus that logs to log.
@@ -46,6 +49,9 @@ func (b *Bus) Unsubscribe(id int) {
 // itself (with the raw TTB blocks), so only the other events are logged
 // here to avoid duplicates.
 func (b *Bus) Publish(ev link.Event) {
+	if b.lineOf != nil && ev.Node != "" && !ev.HasLine {
+		ev.Line, ev.HasLine = b.lineOf(ev.Node)
+	}
 	if ev.Kind != link.EvDump && ev.Kind != link.EvKeepalive {
 		lv := logx.Info
 		if ev.Kind == link.EvError {
@@ -53,7 +59,11 @@ func (b *Bus) Publish(ev link.Event) {
 		}
 		msg := ev.Text
 		if ev.Node != "" {
-			msg = "[" + ev.Node + "] " + msg
+			if ev.HasLine {
+				msg = fmt.Sprintf("[LINE %d %s] %s", ev.Line, ev.Node, msg)
+			} else {
+				msg = "[" + ev.Node + "] " + msg
+			}
 		}
 		lines := []string{msg}
 		for _, l := range ev.Lines {

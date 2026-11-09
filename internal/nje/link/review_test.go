@@ -674,3 +674,26 @@ func TestRecordLengthByte(t *testing.T) {
 		t.Fatalf("unprefixed record changed: % X", got)
 	}
 }
+
+// TestOpenCarriesNatOut: behind NAT our OPEN names the public address.
+func TestOpenCarriesNatOut(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	got := make(chan []byte, 1)
+	go func() {
+		c, _ := ln.Accept()
+		defer c.Close()
+		_, raw, _ := tcpip.ReadControl(c)
+		got <- raw
+		c.Write((&tcpip.Control{Type: tcpip.TypeACK, RHost: "B", OHost: "A"}).Marshal())
+	}()
+	c, _ := net.Dial("tcp", ln.Addr().String())
+	defer c.Close()
+	if err := ClientOpen(c, Params{Local: "A", Remote: "B", NatOut: net.IPv4(35, 192, 26, 118), Handler: newHandler()}); err != nil {
+		t.Fatal(err)
+	}
+	raw := <-got
+	if !bytes.Equal(raw[16:20], []byte{35, 192, 26, 118}) {
+		t.Fatalf("RIP % X", raw[16:20])
+	}
+}

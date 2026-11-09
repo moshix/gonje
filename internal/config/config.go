@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -30,6 +31,10 @@ type Remote struct {
 	Turn       string // "free" (default: send any time) or "strict" (BSC alternation)
 	MaxStreams int    // concurrent SYSIN/SYSOUT streams, 1-8 (0 = default 1)
 	BufSize    int    // NJE buffer size we advertise (0 = default 8192)
+	NatIn      string // our inside (private) IPv4 for this link: dial source
+	NatOut     string // our outside (public) IPv4 as the peer sees it
+	Line       int    // LINE number (0-999), unique
+	LineSet    bool   // Line was given explicitly (remote_line)
 }
 
 // Config is the whole gonje configuration.
@@ -218,6 +223,22 @@ func Parse(r io.Reader) (*Config, error) {
 			c.Remotes = append(c.Remotes, cur)
 		case "remote_host_addr":
 			cur.Addr = t.val
+		case "remote_natin", "remote_natout":
+			ip, err := IPv4(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			if t.key == "remote_natin" {
+				cur.NatIn = ip
+			} else {
+				cur.NatOut = ip
+			}
+		case "remote_line":
+			n, err := LineNumber(t.val)
+			if err != nil {
+				return nil, bad(err)
+			}
+			cur.Line, cur.LineSet = n, true
 		case "remote_host_port":
 			p, err := port(t.val)
 			if err != nil {
@@ -274,6 +295,9 @@ func Parse(r io.Reader) (*Config, error) {
 func (c *Config) validate() error {
 	if c.LocalNode == "" {
 		return fmt.Errorf("local_node is required")
+	}
+	if err := AssignLines(c.Remotes); err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	for _, r := range c.Remotes {
@@ -386,6 +410,52 @@ func port(s string) (int, error) { return intRange(s, 1, 65535) }
 // Port validates a TCP port number (1-65535).
 func Port(s string) (int, error) { return port(s) }
 
+// IPv4 validates a dotted IPv4 address (NAT settings).
+func IPv4(s string) (string, error) {
+	ip := net.ParseIP(s)
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("%q is not an IPv4 address", s)
+	}
+	return ip.To4().String(), nil
+}
+
+// LineNumber validates a LINE number (0-999).
+func LineNumber(s string) (int, error) {
+	n, err := intRange(s, 0, 999)
+	if err != nil {
+		return 0, fmt.Errorf("line: %v", err)
+	}
+	return n, nil
+}
+
+// AssignLines gives every remote without an explicit remote_line the
+// next free LINE number, in order of appearance from 0, and rejects
+// duplicate explicit numbers (Sine Nomine style "LINE n").
+func AssignLines(rs []*Remote) error {
+	used := map[int]string{}
+	for _, r := range rs {
+		if !r.LineSet {
+			continue
+		}
+		if other, dup := used[r.Line]; dup {
+			return fmt.Errorf("line %d used by both %s and %s", r.Line, other, r.Name)
+		}
+		used[r.Line] = r.Name
+	}
+	next := 0
+	for _, r := range rs {
+		if r.LineSet {
+			continue
+		}
+		for used[next] != "" {
+			next++
+		}
+		r.Line = next
+		used[next] = r.Name
+	}
+	return nil
+}
+
 // MaxStreams validates a stream count: 1-8 (the FCS has bits for 8
 // shared SYSIN/SYSOUT streams).
 func MaxStreams(s string) (int, error) {
@@ -450,6 +520,16 @@ func ValidateRemote(r *Remote, local string) error {
 		return err
 	}
 	r.Password = pw
+	for _, ip := range []string{r.NatIn, r.NatOut} {
+		if ip != "" {
+			if _, err := IPv4(ip); err != nil {
+				return err
+			}
+		}
+	}
+	if r.Line < 0 || r.Line > 999 {
+		return fmt.Errorf("line %d out of range 0-999", r.Line)
+	}
 	if r.BufSize != 0 && (r.BufSize < 300 || r.BufSize > 32768) {
 		return fmt.Errorf("buffersize %d out of range 300-32768", r.BufSize)
 	}

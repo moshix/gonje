@@ -21,9 +21,12 @@ type Backend interface {
 	Connect(name string) error
 	Drop(name string) error
 	Drain(name string) (string, error)
-	SendMessage(node, user, text string) error
-	SendCommand(node, cmd string) error
-	SendFile(node, user, path string) (*link.OutboundFile, error)
+	// The send calls take a callback: done(nil) when the message or
+	// command has been written to the link (file: delivered or counted
+	// as sent), done(err) when it failed later. It must not block.
+	SendMessageNotify(node, user, text string, done func(error)) error
+	SendCommandNotify(node, cmd string, done func(error)) error
+	SendFileNotify(node, user, path string, done func(error)) (*link.OutboundFile, error)
 	SetLocalName(name string) (int, error)
 	SetListen(ip string, port int) error
 	SetTimeout(sec int) error
@@ -80,6 +83,8 @@ type Shell struct {
 	quitting    bool
 	focus       int          // scroll focus (focusCommands/Events/Messages)
 	msgLines    int          // messages pane height
+	echoMark    *sendMark    // mark of the command line being submitted
+	mk          marks        // send results from the link goroutines
 	msgNew      bool         // a message arrived while the pane was scrolled back
 	bell        bool         // ring the bell at the next draw
 	pg          *pager       // non-nil while long output is being paged
@@ -103,7 +108,7 @@ func New(be Backend, set Settings) *Shell {
 	}
 	return &Shell{be: be, set: set, level: set.Level, split: set.Split,
 		events: NewPanel(PanelMax), results: NewPanel(ResultsMax), mixed: NewPanel(ResultsMax),
-		msgs: NewPanel(PanelMax), msgLines: msgPaneDefault(set.MsgPane),
+		msgs: NewPanel(PanelMax), msgLines: msgPaneDefault(set.MsgPane), mk: marks{wake: make(chan struct{}, 1)},
 		editor: NewEditor(LoadHistory(set.HistoryPath)), box: box, now: time.Now}
 }
 
@@ -220,7 +225,7 @@ func FormatEvent(ev link.Event) []Line {
 	tag, color := eventStyle(ev.Kind)
 	head := SegLine(Seg{ev.Time.Format("15:04:05") + " ", Dim},
 		Seg{fmt.Sprintf("%-4s %s ", tag, direction(ev.Kind)), color},
-		Seg{ev.Node, Bold}, Seg{" " + ev.Text, color})
+		Seg{nodeLabel(ev), Bold}, Seg{" " + ev.Text, color})
 	head.Color, head.Cont = color, "         "
 	out := []Line{head}
 	for _, l := range ev.Lines {
@@ -307,7 +312,7 @@ func warnLine(text string) Line { return Line{Text: text, Color: Yellow} }
 // log shows what the operator did and what the screen said.
 func (s *Shell) Exec(line string) Result {
 	if strings.TrimSpace(line) != "" {
-		s.set.Log.Info("operator: " + line)
+		s.set.Log.Info("operator: " + maskSecrets(line))
 	}
 	res := s.exec(line)
 	for i, l := range res.Lines {
@@ -328,13 +333,26 @@ func (s *Shell) Exec(line string) Result {
 // snaps every pane back to live.
 func (s *Shell) submit(line string) Result {
 	ptext, psegs := s.prompt()
-	echo := SegLine(append(psegs, Seg{line, Bold})...)
-	echo.Text = ptext + line
+	shown := maskSecrets(line) // the echo stays in the results pane
+	echo := SegLine(append(psegs, Seg{shown, Bold})...)
+	echo.Text = ptext + shown
+	// msg/cmd/send put their status mark on this line (see mark.go).
+	echo.Mark = &sendMark{unicode: s.box.H == unicodeBox.H}
 	s.addResult(echo)
+	s.echoMark = echo.Mark
 	res := s.Exec(line)
+	s.echoMark = nil
 	s.showResult(res.Lines, 1) // the echo line takes one row of the page
 	s.events.Live()
 	s.mixed.Live()
 	s.results.Live()
 	return res
+}
+
+// nodeLabel names an event's node with its LINE number: "LINE 0 HOUCICS".
+func nodeLabel(ev link.Event) string {
+	if ev.HasLine && ev.Node != "" {
+		return fmt.Sprintf("LINE %d %s", ev.Line, ev.Node)
+	}
+	return ev.Node
 }

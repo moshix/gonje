@@ -46,12 +46,14 @@ const (
 
 // Event is something worth showing in the event panel and the log.
 type Event struct {
-	Time  time.Time
-	Kind  Kind
-	Level int
-	Node  string   // remote node the event relates to ("" = local)
-	Text  string   // one-line summary
-	Lines []string // optional detail (hex dump lines)
+	Time    time.Time
+	Kind    Kind
+	Level   int
+	Node    string   // remote node the event relates to ("" = local)
+	Line    int      // LINE number of Node (filled by the node's bus)
+	HasLine bool     // Line is set
+	Text    string   // one-line summary
+	Lines   []string // optional detail (hex dump lines)
 }
 
 // Handler receives everything a session produces. Implementations must be
@@ -94,6 +96,13 @@ type OutboundFile struct {
 	CC       byte     // carriage control kind of the records (CCNone...)
 	Records  [][]byte // EBCDIC (text) or raw (binary) records, no CC
 	Queued   time.Time
+	// Spool is the forward spool file of a store-and-forward file (set
+	// by the node; "" for files sent from local disk).
+	Spool string `json:"-"`
+	// Done (if set) is called once when the file is finished: nil when
+	// delivered (C0) or counted as sent (EOF grace), else the reason it
+	// was refused, failed or discarded. It must not block.
+	Done func(error) `json:"-"`
 }
 
 // Carriage control kinds of a received data record (SRCB bits 10cc....).

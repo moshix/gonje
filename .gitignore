@@ -3,6 +3,7 @@ gonje.cnf
 
 # Runtime output
 gonje.log
+gonje.pid
 *.log
 inbox/
 outbox/

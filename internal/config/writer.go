@@ -18,6 +18,7 @@ type File struct {
 	Path  string
 	lines []string
 	nl    bool // the file ended with a newline
+	crlf  bool // the file uses CRLF line ends (kept for inserted lines)
 	mode  os.FileMode
 }
 
@@ -42,6 +43,7 @@ func OpenFile(path string) (*File, error) {
 	text := string(b)
 	f := &File{Path: path, mode: st.Mode().Perm(), nl: strings.HasSuffix(text, "\n")}
 	f.lines = strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	f.crlf = len(f.lines) > 0 && strings.HasSuffix(f.lines[0], "\r")
 	if text == "" {
 		f.lines = nil
 	}
@@ -50,7 +52,19 @@ func OpenFile(path string) (*File, error) {
 
 // Bytes returns the edited file content.
 func (f *File) Bytes() []byte {
-	s := strings.Join(f.lines, "\n")
+	lines := f.lines
+	if f.crlf {
+		// Lines added by the editors have no "\r": give them one so the
+		// file does not end up with mixed line ends.
+		lines = make([]string, len(f.lines))
+		for i, l := range f.lines {
+			if !strings.HasSuffix(l, "\r") {
+				l += "\r"
+			}
+			lines[i] = l
+		}
+	}
+	s := strings.Join(lines, "\n")
 	if f.nl || len(f.lines) > 0 {
 		s += "\n"
 	}
@@ -92,26 +106,35 @@ func (f *File) toks() []ftok {
 }
 
 // block returns the token index range [from, to) of the remote named
-// name: its remote_host_name token up to the next one. ok=false if the
-// remote is not in the file.
+// name: its remote_host_name token up to (and including) the last
+// remote_* token before the next remote_host_name. The loader accepts
+// top-level keys anywhere, so route=, timeout= and the like that follow
+// the last remote block are not part of it (deleting the remote must
+// never take them along). Non-remote tokens inside the range are left
+// alone by the editors. ok=false if the remote is not in the file.
 func block(toks []ftok, name string) (from, to int, ok bool) {
 	from = -1
 	for i, t := range toks {
-		if t.key != "remote_host_name" {
-			continue
-		}
-		if from >= 0 {
-			return from, i, true
-		}
-		if strings.EqualFold(t.val, name) {
+		if t.key == "remote_host_name" && strings.EqualFold(t.val, name) {
 			from = i
+			break
 		}
 	}
 	if from < 0 {
 		return 0, 0, false
 	}
-	return from, len(toks), true
+	to = from + 1
+	for i := from + 1; i < len(toks) && toks[i].key != "remote_host_name"; i++ {
+		if isRemoteKey(toks[i].key) {
+			to = i + 1
+		}
+	}
+	return from, to, true
 }
+
+// isRemoteKey reports whether a (normalized) key belongs to a remote
+// block.
+func isRemoteKey(key string) bool { return strings.HasPrefix(key, "remote_") }
 
 // setValue replaces the value of token t, keeping its key spelling.
 func (f *File) setValue(t ftok, val string) {
@@ -176,8 +199,14 @@ func (f *File) SetLocal(key, val string) {
 	for i := range toks {
 		if toks[i].key == "remote_host_name" {
 			if last == nil {
-				// Only remote blocks: put the setting above the first one.
-				f.insertLine(toks[i].line, key+"="+val)
+				// Only remote blocks: put the setting above the first
+				// one and above the comment lines directly before it
+				// (they describe that remote).
+				at := toks[i].line
+				for at > 0 && strings.HasPrefix(strings.TrimSpace(f.lines[at-1]), "#") {
+					at--
+				}
+				f.insertLine(at, key+"="+val)
 				return
 			}
 			break
@@ -218,6 +247,10 @@ func remoteKeys(r *Remote, toks []ftok) [][2]string {
 	if r.BufSize > 0 {
 		bufSize = strconv.Itoa(r.BufSize)
 	}
+	line := "" // only explicit line numbers are written
+	if r.LineSet {
+		line = strconv.Itoa(r.Line)
+	}
 	maxStreams := ""
 	if r.MaxStreams > 0 {
 		maxStreams = strconv.Itoa(r.MaxStreams)
@@ -230,6 +263,9 @@ func remoteKeys(r *Remote, toks []ftok) [][2]string {
 		{"remote_strict_bcb", strict},
 		{"remote_turn", turn},
 		{"remote_max_streams", maxStreams},
+		{"remote_natin", r.NatIn},
+		{"remote_natout", r.NatOut},
+		{"remote_line", line},
 		{"remote_buffersize", bufSize},
 	}
 }
@@ -293,20 +329,46 @@ func (f *File) DeleteRemote(name string) bool {
 	first, last := toks[from].line, toks[to-1].line
 	inBlock := map[int][]ftok{}
 	for _, t := range toks[from:to] {
-		inBlock[t.line] = append(inBlock[t.line], t)
+		if isRemoteKey(t.key) {
+			inBlock[t.line] = append(inBlock[t.line], t)
+		}
 	}
-	// Lines that also hold tokens outside the block keep those tokens.
+	// Lines that also hold tokens outside the block (or top-level keys
+	// in the middle of it) keep those tokens.
 	others := map[int]bool{}
 	for i, t := range toks {
-		if (i < from || i >= to) && t.line >= first && t.line <= last {
+		if (i < from || i >= to || !isRemoteKey(t.key)) && t.line >= first && t.line <= last {
 			others[t.line] = true
+		}
+	}
+	// A comment or blank line inside the block is dropped only when the
+	// next line with keys belongs to the block alone: a comment that
+	// introduces a top-level key (route=, timeout=...) stays with it.
+	keep := map[int]bool{}
+	next := -1 // the next line with tokens, scanning upwards
+	for n := last; n >= first; n-- {
+		if inBlock[n] != nil || others[n] {
+			next = n
+			continue
+		}
+		if next >= 0 && others[next] && inBlock[next] == nil {
+			keep[n] = true
+		}
+	}
+	// The comment lines directly above the remote_host_name line (no
+	// blank line between) describe this remote: they go with it.
+	if strings.TrimSpace(f.lines[first][:toks[from].start]) == "" {
+		for first > 0 && strings.HasPrefix(strings.TrimSpace(f.lines[first-1]), "#") {
+			first--
 		}
 	}
 	var out []string
 	for n, l := range f.lines {
 		switch {
-		case n < first || n > last:
+		case n < first || n > last || keep[n]:
 			out = append(out, l)
+		case others[n] && inBlock[n] == nil:
+			out = append(out, l) // only top-level keys on this line
 		case others[n]:
 			// Shared line (e.g. the next block starts here): drop only
 			// this block's tokens, right to left.
@@ -323,32 +385,61 @@ func (f *File) DeleteRemote(name string) bool {
 	return true
 }
 
-// routeLine reports whether line n is a route=<dest>,... line and its
-// destination. A route line holds only the route (plus a comment).
-func (f *File) routeLine(n int) (string, bool) {
-	t := scanLine(n, f.lines[n])
-	if len(t) == 0 || t[0].key != "route" {
-		return "", false
-	}
-	dest, _, _ := strings.Cut(t[0].val, ",")
-	return strings.ToUpper(dest), true
-}
-
-// commentOf returns the " # ..." part of a line, if any.
-func commentOf(line string) string {
-	for i := 0; i < len(line); i++ {
-		if line[i] == '#' && (i == 0 || isSep(line[i-1])) {
-			j := i // keep the blanks before the comment as they were
-			for j > 0 && (line[j-1] == ' ' || line[j-1] == '\t') {
-				j--
+// routeTok finds the route=<dest>,... token for dest anywhere in the
+// file (it may share a line with other keys). A route value contains
+// commas, which the scanner treats as separators, so the token is
+// widened to the end of the "dest,via[,alt]" run.
+func (f *File) routeTok(dest string) (ftok, bool) {
+	for n, l := range f.lines {
+		for _, t := range scanLine(n, l) {
+			if t.key != "route" {
+				continue
 			}
-			if j == 0 {
-				return " " + line[i:]
+			t = widenRoute(l, t)
+			d, _, _ := strings.Cut(t.val, ",")
+			if strings.EqualFold(d, dest) {
+				return t, true
 			}
-			return line[j:]
 		}
 	}
-	return ""
+	return ftok{}, false
+}
+
+// widenRoute extends a route token over the bare words that follow it
+// on its line, exactly like the loader glues them (route=X,A,B and
+// route=X, A are scanned as route=X plus bare words).
+func widenRoute(line string, t ftok) ftok {
+	end := t.end
+	for i := end; i < len(line); {
+		if isSep(line[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(line) && !isSep(line[j]) {
+			j++
+		}
+		if line[i] == '#' || strings.Contains(line[i:j], "=") {
+			break // a comment or the next key=value token
+		}
+		end, i = j, j
+	}
+	_, v, _ := strings.Cut(line[t.start:end], "=")
+	t.end, t.val = end, v
+	return t
+}
+
+// lastRouteLine is the last line holding a route token, or -1.
+func (f *File) lastRouteLine() int {
+	last := -1
+	for n, l := range f.lines {
+		for _, t := range scanLine(n, l) {
+			if t.key == "route" {
+				last = n
+			}
+		}
+	}
+	return last
 }
 
 // SetRoute adds or replaces the route=<dest>,<via>[,<alt>] line for
@@ -356,17 +447,11 @@ func commentOf(line string) string {
 // last top-level setting before the first remote block.
 func (f *File) SetRoute(r Route) {
 	text := "route=" + r.String()
-	last := -1
-	for n := range f.lines {
-		if dest, ok := f.routeLine(n); ok {
-			if dest == r.Dest {
-				f.lines[n] = text + commentOf(f.lines[n])
-				return
-			}
-			last = n
-		}
+	if t, ok := f.routeTok(r.Dest); ok {
+		f.setValue(t, r.String())
+		return
 	}
-	if last >= 0 {
+	if last := f.lastRouteLine(); last >= 0 {
 		f.insertLine(last+1, text)
 		return
 	}
@@ -388,13 +473,11 @@ func (f *File) SetRoute(r Route) {
 // DeleteRoute removes the route line for dest; it reports whether one
 // existed.
 func (f *File) DeleteRoute(dest string) bool {
-	for n := range f.lines {
-		if d, ok := f.routeLine(n); ok && d == strings.ToUpper(dest) {
-			f.lines = append(f.lines[:n], f.lines[n+1:]...)
-			return true
-		}
+	t, ok := f.routeTok(dest)
+	if ok {
+		f.removeToken(t)
 	}
-	return false
+	return ok
 }
 
 // DeleteLocal removes a top-level key (e.g. default_route).
@@ -424,7 +507,13 @@ func (f *File) Save() error {
 			mode = 0o600
 		}
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(f.Path), "."+filepath.Base(f.Path)+".tmp*")
+	// A symlinked gonje.cnf: write the file it points to, so the link
+	// stays a link (renaming over it would replace it with a copy).
+	path := f.Path
+	if real, err := filepath.EvalSymlinks(f.Path); err == nil {
+		path = real
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err
 	}
@@ -444,8 +533,14 @@ func (f *File) Save() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp.Name(), f.Path); err != nil {
+	if err := os.Rename(tmp.Name(), path); err != nil {
 		return err
+	}
+	// Make the rename itself durable. Not every system can sync a
+	// directory; the file content is already synced, so ignore that.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		d.Close()
 	}
 	f.mode = mode
 	return nil

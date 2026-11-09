@@ -121,7 +121,9 @@ func (e *Editor) Key(k Key) Action {
 		e.insert([]rune{k.Rune})
 	case KeyEnter:
 		line := string(e.buf)
-		added := e.AddHistory(line)
+		// The history (memory and ~/.gonje_history) never holds a
+		// password: it keeps the masked line.
+		added := e.AddHistory(maskSecrets(line))
 		e.reset()
 		return Action{Kind: ActSubmit, Line: line, Added: added}
 	case KeyBackspace:

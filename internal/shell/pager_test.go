@@ -57,7 +57,7 @@ func TestPagerPageBreaks(t *testing.T) {
 
 func TestPagerQuitAndShortOutput(t *testing.T) {
 	s, _ := newTestShell(t)
-	s.Render(20, 100)
+	s.Render(24, 100)
 	s.showResult(numbered(3), 1) // fits: no paging
 	if s.Paging() || lastResult(s) != "line 003" {
 		t.Fatal("short output paged")

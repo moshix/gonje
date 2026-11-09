@@ -179,6 +179,13 @@ func (n *Node) SetDefaultRoute(name string) error {
 // forwardNMR passes an NMR for another node on (store-and-forward),
 // unchanged so its origin stays intact.
 func (n *Node) forwardNMR(arrived string, m *records.NMR) {
+	// NMRs carry no hop count. One that we sent ourselves and that came
+	// back to us is going round in a routing loop (A->B->C->A): drop it.
+	if strings.EqualFold(strings.TrimSpace(m.FromNode), n.localName()) {
+		n.log.Error(fmt.Sprintf("NMR for %s from our own node came back over %s: routing loop, dropped", clean(m.ToNode), arrived))
+		n.emit(link.EvError, link.L2, arrived, fmt.Sprintf("NMR for %s dropped: routing loop", clean(m.ToNode)))
+		return
+	}
 	_, s, err := n.routeSession(m.ToNode, arrived)
 	if err != nil {
 		n.log.Error(fmt.Sprintf("NMR from %s for %s dropped: %v", clean(m.FromNode), clean(m.ToNode), err))
@@ -215,11 +222,6 @@ func (n *Node) forwardDataset(arrived string, ds *link.InboundDataset, dest stri
 		f.OrigNode, f.FromUser, f.JobName, f.JobID, f.ToUser = j.OrigNode, j.OrigUser, j.JobName, j.JobID, j.PrintUser
 	}
 	f.Hops = hops + 1
-	if f.Hops > maxHops {
-		n.log.Error(fmt.Sprintf("file for %s from %s dropped: more than %d hops (routing loop?)", dest, f.OrigNode, maxHops))
-		n.emit(link.EvError, link.L2, arrived, fmt.Sprintf("file for %s dropped after %d hops", dest, maxHops))
-		return
-	}
 	if h := ds.Header; h != nil {
 		f.ToUser, f.DSName, f.Proc, f.Step = h.Remote, h.Name, h.Proc, h.Step
 		f.RecFM, f.LRECL, f.Punch = h.RecFM, int(h.LRECL), h.Flag2&records.NDHFlag2Punch != 0
@@ -231,28 +233,15 @@ func (n *Node) forwardDataset(arrived string, ds *link.InboundDataset, dest stri
 		f.Records = append(f.Records, r.Data)
 		f.CC = r.CC
 	}
-	n.mu.Lock()
-	r, up, err := n.linkForLocked(dest, arrived)
+	// On disk first: the sender deletes its copy once it has our C0,
+	// which goes out after this handler returns (second review M3).
+	e := n.spoolForward(arrived, dest, f)
+	via, err := n.queueForward(e)
 	if err != nil {
-		n.mu.Unlock()
-		n.log.Error(fmt.Sprintf("file for %s from %s dropped: %v", dest, f.OrigNode, err))
-		n.emit(link.EvError, link.L2, arrived, fmt.Sprintf("file for %s not forwarded: %v", dest, err))
-		return
-	}
-	n.jobID = n.jobID%9999 + 1
-	n.fileID++
-	f.ID = n.fileID
-	if f.JobID == 0 {
-		f.JobID = uint16(n.jobID)
-	}
-	r.queue = append(r.queue, f)
-	s := r.sess
-	n.mu.Unlock()
-	if up {
-		s.Kick()
+		return // held, logged and reported by queueForward
 	}
 	text := fmt.Sprintf("forwarding file %s from %s/%s to %s/%s via %s (hop %d)",
-		f.Name, f.OrigNode, f.FromUser, dest, f.ToUser, r.cfg.Name, f.Hops)
+		f.Name, f.OrigNode, f.FromUser, dest, f.ToUser, via, f.Hops)
 	n.log.Info(text)
 	n.emit(link.EvFileOut, link.L2, arrived, text)
 }

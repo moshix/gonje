@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -233,6 +234,7 @@ func SaveDatasetInfo(dir, remote string, ds *link.InboundDataset, now time.Time)
 		raw[i] = r.Data
 	}
 	var extra [][2]string // NETDATA details for the sidecar
+	binary := false       // save the raw records whatever they look like
 	if stream := bytes.Join(body, nil); netdata.IsNetdata(stream) {
 		nd, perr := netdata.Parse(stream)
 		if perr == nil {
@@ -244,17 +246,23 @@ func SaveDatasetInfo(dir, remote string, ds *link.InboundDataset, now time.Time)
 			warn = "NETDATA could not be decoded, saved raw: " + perr.Error()
 			extra = [][2]string{{"netdata", "invalid (" + perr.Error() + ")"}}
 		case nd.PDS():
-			extra = append(extra, [2]string{"netdata", "pds (not unpacked)"})
+			// An IEBCOPY unload must never be flattened into text: keep
+			// the whole NETDATA stream (it can still be RECEIVEd).
+			raw, binary = body, true
+			extra = append(extra, [2]string{"netdata", "pds"})
 		default:
 			recs := nd.Records
 			if nd.Fixed() {
-				recs = netdata.StripSequenceNumbers(recs)
+				var stripped bool
+				if recs, stripped = netdata.StripSequenceNumbers(recs); stripped {
+					extra = append(extra, [2]string{"seqnums", "stripped"})
+				}
 			}
 			body, raw = recs, nd.Records
 			extra = append(extra, [2]string{"netdata", "yes"})
 		}
 	}
-	text = IsEBCDICText(body)
+	text = !binary && IsEBCDICText(body)
 	var out bytes.Buffer
 	ext := "bin"
 	if text {
@@ -271,8 +279,11 @@ func SaveDatasetInfo(dir, remote string, ds *link.InboundDataset, now time.Time)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", text, warn, err
 	}
-	stem := fmt.Sprintf("%s.%s.%s.%s", fsName(from, "NONODE"), fsName(job, "NOJOB"),
-		fsNameDots(name, "NONAME"), now.Format("20060102150405"))
+	// The parts come from the peer (NETDATA text units can be 64 KB):
+	// cut them to the z/OS sizes so the name stays far below the 255
+	// byte limit of most file systems.
+	stem := fmt.Sprintf("%s.%s.%s.%s", cut(fsName(from, "NONODE"), 8), cut(fsName(job, "NOJOB"), 8),
+		cut(fsNameDots(name, "NONAME"), 44), now.Format("20060102150405"))
 	// Write to a temporary .part file first and link it to its final name
 	// only when complete, so a failed write never leaves a truncated file
 	// that looks like a received one (review N2). os.Link fails if the
@@ -295,7 +306,11 @@ func SaveDatasetInfo(dir, remote string, ds *link.InboundDataset, now time.Time)
 		err := os.Link(tmp.Name(), path)
 		if err == nil {
 			// The sidecar is informational: a failure to write it is
-			// not a failure to receive the file.
+			// not a failure to receive the file. The spool id is the
+			// stable number the shell's spool command shows.
+			if id, err := NextSpoolID(dir); err == nil {
+				extra = append([][2]string{{"id", strconv.Itoa(id)}}, extra...)
+			}
 			_ = writeMeta(path, remote, ds, now, text, out.Len(), extra)
 			return path, text, warn, nil
 		}
@@ -425,4 +440,12 @@ func netdataMeta(nd *netdata.File) [][2]string {
 		{"dsorg", netdata.DSOrgName(nd.DSOrg)}, {"utility", nd.Utility},
 		{"dsname", nd.DSName}, {"records", fmt.Sprint(len(nd.Records))},
 	}
+}
+
+// cut shortens an ASCII file name part to n bytes.
+func cut(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }

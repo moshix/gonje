@@ -4,6 +4,7 @@ package shell
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,7 +133,7 @@ type statsColumn struct {
 // (0 = no limit), dropping low-priority columns until it fits.
 func (s *Shell) statsTable(c node.Counters, width int) []Line {
 	cols := []*statsColumn{
-		{head: "NODE"}, {head: "STATE"}, {head: "SESSION", prio: 2}, {head: "MSG i/o", prio: 3},
+		{head: "LINE"}, {head: "NODE"}, {head: "STATE"}, {head: "SESSION", prio: 2}, {head: "MSG i/o", prio: 3},
 		{head: "CMD i/o", prio: 5}, {head: "FILES i/o", prio: 4}, {head: "BYTES in/out", prio: 3},
 		{head: "NULL i/o", prio: 7}, {head: "CONN", prio: 6}, {head: "ERR", prio: 6}, {head: "LAST", prio: 8},
 	}
@@ -146,7 +147,7 @@ func (s *Shell) statsTable(c node.Counters, width int) []Line {
 		if !x.LastActivity.IsZero() {
 			last = x.LastActivity.Format("15:04:05")
 		}
-		cells := []string{l.Name, l.State.String(), session, io2(x.MsgsIn, x.MsgsOut), io2(x.CmdsIn, x.CmdsOut),
+		cells := []string{strconv.Itoa(l.Line), l.Name, l.State.String(), session, io2(x.MsgsIn, x.MsgsOut), io2(x.CmdsIn, x.CmdsOut),
 			io2(x.FilesIn, x.FilesOut), fmtBytes(x.BytesIn) + "/" + fmtBytes(x.BytesOut),
 			io2(x.KeepaliveIn, x.KeepaliveOut), fmt.Sprint(l.Connects), fmt.Sprint(x.BCBErrors + x.NAKsIn + l.Failures), last}
 		for i, col := range cols {
@@ -211,7 +212,9 @@ func renderTable(cols []*statsColumn, width int, colorFor func(row int, col *sta
 			}
 			segs = append(segs, Seg{text, color(col)})
 		}
-		return SegLine(segs...)
+		l := SegLine(segs...)
+		l.Clip = true // still too wide (no column left to drop): cut, never wrap
+		return l
 	}
 	out := []Line{row(func(c *statsColumn) string { return c.head }, func(*statsColumn) Color { return Bold })}
 	if len(cols) == 0 {
@@ -251,9 +254,10 @@ func (s *Shell) linkStats(l node.LinkCounters) []Line {
 		state += " (held)"
 	}
 	return []Line{
-		SegLine(Seg{"link ", Default}, Seg{l.Name, BoldCyan}),
+		SegLine(Seg{fmt.Sprintf("LINE %d ", l.Line), Dim}, Seg{l.Name, BoldCyan}),
 		kv("state", state, stateColor(l.State)),
 		kv("address", addr, Default),
+		kv("nat in/out", orDash(l.NatIn)+" / "+orDash(l.NatOut), Default),
 		kv("session uptime", session, Default),
 		kv("connected total", fmtDur(l.Connected), Default),
 		kv("buffer size", bufText(l.BufSize, x.PeerBufSize), Default),

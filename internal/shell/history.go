@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -49,6 +50,7 @@ func AppendHistory(path, line string) {
 	if path == "" || strings.ContainsAny(line, "\n\r") {
 		return
 	}
+	line = maskSecrets(line)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
@@ -60,4 +62,14 @@ func AppendHistory(path, line string) {
 		lines := LoadHistory(path)
 		_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 	}
+}
+
+// secretRE matches password=<value> and remote_password=<value> (any
+// case, '-' for '_') as a word of a command line.
+var secretRE = regexp.MustCompile(`(^|[\s,])((?i:remote[_-]password|password)=)[^\s,]*`)
+
+// maskSecrets replaces password values in a command line with "***",
+// for the log, the history and the echoed command.
+func maskSecrets(line string) string {
+	return secretRE.ReplaceAllString(line, "${1}${2}***")
 }

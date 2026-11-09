@@ -65,6 +65,8 @@ type Params struct {
 	// MaxStreams: concurrent SYSIN/SYSOUT transfers per direction (1-8;
 	// the FCS has 8 shared SYSIN/SYSOUT bits, spec 02 section 1.3).
 	MaxStreams int
+	// NatOut: our public address behind NAT; put in RIP of our OPEN.
+	NatOut net.IP
 	// StreamSettle overrides the post-signon settle time (tests only;
 	// 0 = streamSettle).
 	StreamSettle time.Duration
@@ -145,7 +147,11 @@ type Session struct {
 	// reported as undelivered.
 	nmrMu      sync.Mutex
 	nmrPending []*records.NMR
+	nmrDone    []func(error) // callback per pending NMR (may be nil)
 	nmrClosed  bool
+	// nmrSent: callbacks of NMRs taken into the buffer being built; they
+	// run once that buffer has been written to the socket.
+	nmrSent []func(error)
 
 	// --- cross-goroutine plumbing ---
 	inCh    chan []byte
@@ -229,6 +235,16 @@ func (s *Session) sendRaw(rec []byte) error {
 	raw, err := tcpip.WriteBlock(s.conn, rec)
 	if err != nil {
 		return err
+	}
+	// NMRs in this block are now on the wire: tell their senders.
+	s.nmrMu.Lock()
+	sent := s.nmrSent
+	s.nmrSent = nil
+	s.nmrMu.Unlock()
+	for _, done := range sent {
+		if done != nil {
+			done(nil)
+		}
 	}
 	if isIdleRecord(rec) {
 		s.idleOut++
@@ -372,7 +388,11 @@ func (s *Session) dumpRecord(dir string, r records.Record) {
 // send OPEN, expect ACK. A NAK is returned as *NAKError.
 func ClientOpen(conn net.Conn, p Params) error {
 	p.defaults()
-	open := &tcpip.Control{Type: tcpip.TypeOpen, RHost: p.Local, RIP: addrIP(conn.LocalAddr()),
+	rip := addrIP(conn.LocalAddr())
+	if p.NatOut != nil {
+		rip = p.NatOut // behind NAT: tell the peer our public address
+	}
+	open := &tcpip.Control{Type: tcpip.TypeOpen, RHost: p.Local, RIP: rip,
 		OHost: p.Remote, OIP: addrIP(conn.RemoteAddr())}
 	b := open.Marshal()
 	p.Log.Dump(logx.Debug, "-> "+open.String(), b)

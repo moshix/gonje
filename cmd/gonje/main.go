@@ -20,13 +20,14 @@ import (
 	"golang.org/x/term"
 
 	"gonje/internal/config"
+	"gonje/internal/instance"
 	"gonje/internal/node"
 	"gonje/internal/shell"
 )
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.6"
+var version = "0.7"
 
 func main() {
 	node.Version = version
@@ -73,12 +74,28 @@ func run() int {
 		if err != nil {
 			return fail(err.Error())
 		}
+		j.cfgPath = *cfgPath
 		return runBatch(j, cfg, log, os.Stderr, node.Options{})
 	}
 
+	// One interactive gonje per config: the pid file next to the config
+	// is checked (and taken) before binding, so a second instance is
+	// refused even when it would bind another address.
+	lock, stale, err := instance.Acquire(*cfgPath, instance.NewInfo(version, cfg, *cfgPath))
+	if err != nil {
+		log.Error(err.Error())
+		return fail(err.Error())
+	}
+	if stale != nil {
+		log.Info(fmt.Sprintf("removed stale %s of pid %d (started %s)", instance.PidFile, stale.PID,
+			stale.Started.Format("2006-01-02 15:04")))
+	}
+	defer lock.Release()
 	n := node.New(cfg, node.Options{Log: log})
 	if err := n.Listen(); err != nil {
-		return fail(fmt.Sprintf("listen on %s:%d: %v", cfg.LocalIP, cfg.LocalPort, err))
+		msg := instance.Diagnose(cfg, *cfgPath, err)
+		log.Error("listen: " + msg)
+		return fail(msg)
 	}
 	id, events := n.Bus().Subscribe(4096)
 	defer n.Bus().Unsubscribe(id)
@@ -115,6 +132,7 @@ func run() int {
 		if r := recover(); r != nil {
 			log.Error(fmt.Sprintf("panic: %v", r))
 			n.Stop()
+			lock.Release() // os.Exit skips the deferred release
 			fmt.Fprintf(os.Stderr, "gonje: internal error: %v (see log)\n", r)
 			os.Exit(2)
 		}

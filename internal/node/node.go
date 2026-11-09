@@ -178,6 +178,9 @@ type Node struct {
 	ln      net.Listener
 	started bool
 
+	lnmu  sync.Mutex
+	lines map[string]int // remote name -> LINE number (event lines)
+
 	mu       sync.Mutex
 	accepted int       // inbound connections signed on (stats)
 	rejected int       // inbound OPENs answered with NAK (stats)
@@ -195,11 +198,35 @@ func New(cfg *config.Config, opts Options) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{cfg: cfg, opts: opts, log: opts.Log, bus: NewBus(opts.Log), start: time.Now(), since: time.Now(),
 		ctx: ctx, cancel: cancel, remotes: map[string]*remote{}}
+	_ = config.AssignLines(cfg.Remotes) // configs built in code (tests) get lines too
+	n.lines = map[string]int{}
 	for _, r := range cfg.Remotes {
+		n.setLine(r.Name, r.Line, false)
 		n.remotes[r.Name] = &remote{cfg: r, retryDelay: opts.RetryMin}
 		n.order = append(n.order, r.Name)
 	}
+	n.bus.lineOf = n.lineOf
 	return n
+}
+
+// lineOf returns the LINE number of a remote (for event lines). It uses
+// its own small lock: events are emitted while n.mu is held.
+func (n *Node) lineOf(name string) (int, bool) {
+	n.lnmu.Lock()
+	defer n.lnmu.Unlock()
+	l, ok := n.lines[strings.ToUpper(name)]
+	return l, ok
+}
+
+// setLine records (or with del, forgets) a remote's LINE number.
+func (n *Node) setLine(name string, line int, del bool) {
+	n.lnmu.Lock()
+	defer n.lnmu.Unlock()
+	if del {
+		delete(n.lines, name)
+	} else {
+		n.lines[name] = line
+	}
 }
 
 // Config returns the node's configuration.
@@ -299,6 +326,7 @@ func (n *Node) Start() {
 		n.startAccept(n.ln)
 	}
 	n.lmu.Unlock()
+	n.recoverForwards() // files accepted for other nodes before a restart
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, name := range n.order {
@@ -319,6 +347,10 @@ func (n *Node) startAccept(ln net.Listener) {
 func (n *Node) Stop() {
 	n.mu.Lock()
 	n.stopping = true
+	if c := n.queuedForwardsLocked(); c > 0 {
+		n.log.Warn(fmt.Sprintf("%d forwarded file(s) not yet delivered: kept in %s, sent again at the next start",
+			c, ForwardDir(n.cfg.RecvDir)))
+	}
 	var sessions []*link.Session
 	for _, r := range n.remotes {
 		if r.retry != nil {
@@ -471,8 +503,8 @@ func describe(rc config.Remote) string {
 	if addr == "" {
 		addr = "(passive)"
 	}
-	return fmt.Sprintf("%s addr=%s port=%d keepalive=%d password=%s strict_bcb=%v",
-		rc.Name, addr, rc.Port, rc.Keepalive, pw, rc.StrictBCB)
+	return fmt.Sprintf("%s line=%d addr=%s port=%d keepalive=%d password=%s strict_bcb=%v natin=%s natout=%s",
+		rc.Name, rc.Line, addr, rc.Port, rc.Keepalive, pw, rc.StrictBCB, rc.NatIn, rc.NatOut)
 }
 
 // DefineLink adds a new remote at runtime and connects to it (if it has
@@ -486,7 +518,14 @@ func (n *Node) DefineLink(rc config.Remote) error {
 	if n.remotes[rc.Name] != nil {
 		return fmt.Errorf("link %s already exists (use link change)", rc.Name)
 	}
+	if !rc.LineSet {
+		rc.Line = n.nextLineLocked()
+	} else if other := n.lineOwnerLocked(rc.Line); other != "" {
+		return fmt.Errorf("line %d is already used by %s", rc.Line, other)
+	}
+	rc.LineSet = true // a defined link keeps its number when saved
 	cp := rc
+	n.setLine(rc.Name, rc.Line, false)
 	r := &remote{cfg: &cp, retryDelay: n.opts.RetryMin}
 	n.remotes[rc.Name] = r
 	n.order = append(n.order, rc.Name)
@@ -516,7 +555,16 @@ func (n *Node) ChangeLink(rc config.Remote) error {
 	// Field by field: Name never changes, and goroutines read it
 	// without the lock.
 	r.cfg.Addr, r.cfg.Port, r.cfg.Keepalive = rc.Addr, rc.Port, rc.Keepalive
+	if rc.Line != r.cfg.Line {
+		if other := n.lineOwnerLocked(rc.Line); other != "" && other != r.cfg.Name {
+			return fmt.Errorf("line %d is already used by %s", rc.Line, other)
+		}
+	}
 	r.cfg.Password, r.cfg.StrictBCB = rc.Password, rc.StrictBCB
+	r.cfg.Turn, r.cfg.MaxStreams, r.cfg.BufSize = rc.Turn, rc.MaxStreams, rc.BufSize
+	r.cfg.NatIn, r.cfg.NatOut = rc.NatIn, rc.NatOut
+	r.cfg.Line, r.cfg.LineSet = rc.Line, rc.LineSet
+	n.setLine(r.cfg.Name, rc.Line, false)
 	n.log.Info("link change " + describe(rc))
 	return nil
 }
@@ -530,6 +578,42 @@ func (n *Node) DeleteLink(name string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Routes through this link would point nowhere (and a saved config
+	// would no longer load): the operator removes them first.
+	var users []string
+	for _, rt := range n.cfg.Routes {
+		if rt.Via == r.cfg.Name || rt.Alt == r.cfg.Name {
+			users = append(users, "route to "+rt.Dest)
+		}
+	}
+	if n.cfg.DefaultRoute == r.cfg.Name {
+		users = append(users, "the default route")
+	}
+	if len(users) > 0 {
+		return 0, fmt.Errorf("link %s is used by %s: delete or change that first", r.cfg.Name, strings.Join(users, ", "))
+	}
+	// Forwarded files waiting on this link are held on disk, not lost.
+	var held []*link.OutboundFile
+	for _, f := range r.queue {
+		if f.Spool != "" {
+			held = append(held, f)
+		}
+	}
+	// Local files waiting on this link are discarded: tell their senders.
+	for _, f := range r.queue {
+		if f.Done != nil && f.Spool == "" {
+			defer f.Done(errors.New("link deleted"))
+		}
+	}
+	if len(held) > 0 {
+		// Runs before the deferred unlock (LIFO); holdForward does not
+		// take n.mu.
+		defer func() {
+			for _, f := range held {
+				n.forwardDone(r.cfg.Name, f, errors.New("link deleted"))
+			}
+		}()
+	}
 	r.held = true
 	r.gen++ // stale attempts give up
 	if r.retry != nil {
@@ -542,6 +626,7 @@ func (n *Node) DeleteLink(name string) (int, error) {
 		r.sess.Close("link deleted")
 	}
 	delete(n.remotes, r.cfg.Name)
+	n.setLine(r.cfg.Name, 0, true)
 	for i, o := range n.order {
 		if o == r.cfg.Name {
 			n.order = append(n.order[:i], n.order[i+1:]...)
@@ -585,6 +670,7 @@ func (n *Node) paramsLocked(r *remote) link.Params {
 		MaxStreams:   r.cfg.MaxStreams, // 0 = link default 1
 		StreamSettle: n.opts.StreamSettle,
 		BufSize:      r.cfg.BufSize, // 0 = link default 8192
+		NatOut:       net.ParseIP(r.cfg.NatOut),
 		Log:          n.log.With("[" + r.cfg.Name + "]"),
 		Handler:      &handler{n: n},
 	}
@@ -645,19 +731,23 @@ func (n *Node) dialLocked(r *remote) {
 	addr := net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
 	p := n.paramsLocked(r)
 	p.Handshake = n.opts.DialHandshake
-	go n.dialWorker(r, r.gen, addr, p, ctx, cancel)
+	d := net.Dialer{Timeout: 10 * time.Second}
+	if r.cfg.NatIn != "" {
+		// Behind NAT: dial from our inside address for this link.
+		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(r.cfg.NatIn)}
+	}
+	go n.dialWorker(r, r.gen, addr, d, p, ctx, cancel)
 }
 
 // dialWorker connects, exchanges OPEN/ACK and signs on as primary.
 // cancel is always called on return so the attempt's context does not
 // stay registered on the node context (review C2); after a successful
 // signon the socket is already detached from it.
-func (n *Node) dialWorker(r *remote, gen int, addr string, p link.Params, ctx context.Context, cancel context.CancelFunc) {
+func (n *Node) dialWorker(r *remote, gen int, addr string, d net.Dialer, p link.Params, ctx context.Context, cancel context.CancelFunc) {
 	defer n.wg.Done()
 	defer cancel()
 	defer n.guard("connect", func() { n.attemptFailed(r, gen, errors.New("internal error"), 0) })
 	n.emit(link.EvLink, link.L2, r.cfg.Name, "connecting to "+addr)
-	d := net.Dialer{Timeout: 10 * time.Second}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		n.attemptFailed(r, gen, err, 0)
@@ -891,6 +981,22 @@ func (n *Node) handleInbound(c net.Conn) {
 		nak(tcpip.NAKNoSuchLink, "unknown link "+open.RHost+" -> "+open.OHost)
 		return
 	}
+	n.mu.Lock()
+	natIn, natOut := r.cfg.NatIn, r.cfg.NatOut
+	n.mu.Unlock()
+	if natOut != "" {
+		reply.RIP = net.ParseIP(natOut) // behind NAT: our public address
+	}
+	// OIP is not enforced (never was: NAT and multi-homed hosts make it
+	// unreliable). It is logged when it is none of our known addresses.
+	if oip := open.RIP; open.OIP != nil && !open.OIP.IsUnspecified() {
+		known := open.OIP.Equal(localIP(c)) || (natOut != "" && open.OIP.Equal(net.ParseIP(natOut))) ||
+			(natIn != "" && open.OIP.Equal(net.ParseIP(natIn)))
+		if !known {
+			n.log.Warn(fmt.Sprintf("NONSTANDARD OPEN from %s (%s) addressed to OIP %s, which is not one of our addresses",
+				open.RHost, oip, open.OIP))
+		}
+	}
 
 	n.mu.Lock()
 	if n.stopping {
@@ -1023,6 +1129,25 @@ func bufOrDefault(n int) int {
 	return n
 }
 
+// nextLineLocked is the lowest LINE number not in use.
+func (n *Node) nextLineLocked() int {
+	for l := 0; ; l++ {
+		if n.lineOwnerLocked(l) == "" {
+			return l
+		}
+	}
+}
+
+// lineOwnerLocked names the remote using LINE l ("" = free).
+func (n *Node) lineOwnerLocked(l int) string {
+	for _, r := range n.remotes {
+		if r.cfg.Line == l {
+			return r.cfg.Name
+		}
+	}
+	return ""
+}
+
 // visibleState is the state shown to the operator (Up while draining is
 // reported as Draining).
 func (r *remote) visibleState() State {
@@ -1136,6 +1261,14 @@ func (n *Node) session(name string) (*remote, *link.Session, error) {
 
 // SendMessage sends a message to user at node ("*" = operator console).
 func (n *Node) SendMessage(node, user, text string) error {
+	return n.SendMessageNotify(node, user, text, nil)
+}
+
+// SendMessageNotify is SendMessage with a callback: done gets nil once
+// every NMR of the message has been written to the link, or the error
+// that stopped it (called at most once, never under node locks; it must
+// not block).
+func (n *Node) SendMessageNotify(node, user, text string, done func(error)) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("empty message")
 	}
@@ -1145,8 +1278,10 @@ func (n *Node) SendMessage(node, user, text string) error {
 	if err != nil {
 		return err
 	}
-	for _, m := range records.NewMessages(n.localName(), n.opts.User, dest, strings.ToUpper(user), text) {
-		if err := s.SendNMR(m); err != nil {
+	msgs := records.NewMessages(n.localName(), n.opts.User, dest, strings.ToUpper(user), text)
+	cb := joinDone(len(msgs), done)
+	for _, m := range msgs {
+		if err := s.SendNMRNotify(m, cb); err != nil {
 			return err
 		}
 	}
@@ -1155,7 +1290,11 @@ func (n *Node) SendMessage(node, user, text string) error {
 }
 
 // SendCommand sends an unformatted command to node.
-func (n *Node) SendCommand(node, cmd string) error {
+func (n *Node) SendCommand(node, cmd string) error { return n.SendCommandNotify(node, cmd, nil) }
+
+// SendCommandNotify is SendCommand with a write callback (see
+// SendMessageNotify).
+func (n *Node) SendCommandNotify(node, cmd string, done func(error)) error {
 	dest := strings.ToUpper(node)
 	r, s, err := n.routeSession(dest, "")
 	if err != nil {
@@ -1165,7 +1304,7 @@ func (n *Node) SendCommand(node, cmd string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.SendNMR(m); err != nil {
+	if err := s.SendNMRNotify(m, joinDone(1, done)); err != nil {
 		return err
 	}
 	n.mu.Lock()
@@ -1179,6 +1318,12 @@ func (n *Node) SendCommand(node, cmd string) error {
 // SendFile queues a file for user at node. It is sent as soon as the
 // link is up. path is tried as given, then relative to send_dir.
 func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
+	return n.SendFileNotify(node, user, path, nil)
+}
+
+// SendFileNotify is SendFile with a completion callback (see
+// link.OutboundFile.Done).
+func (n *Node) SendFileNotify(node, user, path string, done func(error)) (*link.OutboundFile, error) {
 	// Files for a routed node queue on the via link even if it is down.
 	dest := strings.ToUpper(node)
 	n.mu.Lock()
@@ -1197,6 +1342,7 @@ func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	f.Done = joinDone(1, done)
 	n.mu.Lock()
 	n.jobID = n.jobID%9999 + 1
 	n.fileID++
@@ -1221,8 +1367,11 @@ func (n *Node) SendFile(node, user, path string) (*link.OutboundFile, error) {
 
 // LinkStatus describes one remote for "nodes" and Q LINKS.
 type LinkStatus struct {
-	BufSize    int // buffer size we advertise
-	MaxStreams int // concurrent transfers each way
+	Line       int    // LINE number
+	NatIn      string // NAT inside address ("" = none)
+	NatOut     string // NAT outside address ("" = none)
+	BufSize    int    // buffer size we advertise
+	MaxStreams int    // concurrent transfers each way
 	Name       string
 	Addr       string
 	State      State
@@ -1240,7 +1389,7 @@ func (n *Node) Status() []LinkStatus {
 	var out []LinkStatus
 	for _, name := range n.order {
 		r := n.remotes[name]
-		st := LinkStatus{Name: name, BufSize: bufOrDefault(r.cfg.BufSize), MaxStreams: max(r.cfg.MaxStreams, 1), State: r.visibleState(), Since: r.since, Held: r.held,
+		st := LinkStatus{Name: name, Line: r.cfg.Line, NatIn: r.cfg.NatIn, NatOut: r.cfg.NatOut, BufSize: bufOrDefault(r.cfg.BufSize), MaxStreams: max(r.cfg.MaxStreams, 1), State: r.visibleState(), Since: r.since, Held: r.held,
 			Queued: len(r.queue), LastErr: r.lastErr}
 		if r.cfg.Addr != "" {
 			st.Addr = net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
@@ -1283,6 +1432,10 @@ func (h *handler) NextFile(remote string, busy []*link.OutboundFile) *link.Outbo
 }
 
 func (h *handler) FileDone(remote string, f *link.OutboundFile, err error) {
+	defer h.n.forwardDone(remote, f, err) // after the unlock: file I/O
+	if f.Done != nil {
+		defer f.Done(err)
+	}
 	h.n.mu.Lock()
 	defer h.n.mu.Unlock()
 	r := h.n.remotes[remote]
@@ -1413,4 +1566,27 @@ func clean(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// joinDone returns a callback to hand to k sends that calls done once:
+// with the first error, or with nil when all k succeeded. nil done gives
+// nil.
+func joinDone(k int, done func(error)) func(error) {
+	if done == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	left, fired := k, false
+	return func(err error) {
+		mu.Lock()
+		left--
+		fire := !fired && (err != nil || left <= 0)
+		if fire {
+			fired = true
+		}
+		mu.Unlock()
+		if fire {
+			done(err)
+		}
+	}
 }

@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"gonje/internal/config"
+	"gonje/internal/instance"
 	"gonje/internal/logx"
 	"gonje/internal/nje/link"
 	"gonje/internal/node"
@@ -40,6 +43,16 @@ func parseArgs(args []string, stderr io.Writer) (*cliOpts, error) {
 	fs.Var(&o.split, "split", "start in split view (-split=false: single pane; default from config)")
 	fs.BoolVar(&o.version, "v", false, "print the version and exit")
 	fs.IntVar(&o.wait, "w", 30, "batch cmd: seconds to wait for responses")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, `usage: gonje [-c|-f gonje.cnf] [-split=true|false] [-log gonje.log] [-v]
+       gonje [-f gonje.cnf] -c send <file> <node> <user>
+       gonje [-f gonje.cnf] -c cmd [-w secs] <node> <command>
+       gonje [-f gonje.cnf] -c msg <node> <user> <text>
+batch exit codes: 0 done, 1 error, 3 interrupted (SIGINT/SIGTERM)
+batch mode needs a direct link to <node> (no routing)
+`)
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -74,6 +87,9 @@ type batchJob struct {
 	quiet time.Duration // cmd: finish this long after the last response
 	grace time.Duration // msg: wait after the NMR was written
 	setup time.Duration // connect + signon timeout
+	// cfgPath: the config file (to find a running interactive gonje
+	// when our listener port is busy).
+	cfgPath string
 }
 
 // newBatchJob checks the operands of a batch action:
@@ -117,8 +133,27 @@ type batch struct {
 	log    *logx.Logger
 	events <-chan link.Event
 	up     bool      // signed on: from now on a lost link is fatal
-	got    int       // responses/messages received from the node
+	got    int       // command responses received from the node
 	last   time.Time // when the last one arrived
+	intr   <-chan os.Signal
+	// interrupted: SIGINT/SIGTERM arrived; fail() then reports
+	// "interrupted" and exits with exitInterrupted.
+	interrupted bool
+}
+
+// Batch exit codes.
+const (
+	exitOK          = 0
+	exitError       = 1
+	exitInterrupted = 3
+)
+
+// batchSignals subscribes to the signals that interrupt a batch job (a
+// variable so tests can send a fake signal).
+var batchSignals = func() (<-chan os.Signal, func()) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	return c, func() { signal.Stop(c) }
 }
 
 func (b *batch) say(s string) {
@@ -127,8 +162,12 @@ func (b *batch) say(s string) {
 }
 
 func (b *batch) fail(s string) int {
+	if b.interrupted {
+		b.say("interrupted")
+		return exitInterrupted
+	}
 	b.say("error: " + s)
-	return 1
+	return exitError
 }
 
 // show prints inbound traffic that arrives while connected.
@@ -136,9 +175,12 @@ func (b *batch) show(ev link.Event) {
 	switch ev.Kind {
 	case link.EvMsgIn, link.EvRspIn, link.EvCmdIn:
 		fmt.Fprintf(b.out, "%s: %s\n", ev.Node, ev.Text)
-		if ev.Node == b.j.node && ev.Kind != link.EvCmdIn {
-			// Counted here so a fast response that arrives while we are
-			// still waiting for the command to be written is not missed.
+		if ev.Node == b.j.node && ev.Kind == link.EvRspIn {
+			// Only real responses count (the node classifies a message
+			// addressed to us after our command as one); an unrelated
+			// message is shown but does not end the wait. Counted here
+			// so a fast response that arrives while we are still
+			// waiting for the command to be written is not missed.
 			b.got++
 			b.last = time.Now()
 		}
@@ -175,6 +217,9 @@ func (b *batch) waitEvent(timeout time.Duration, match func(link.Event) (bool, e
 			}
 		case <-deadline.C:
 			return fmt.Errorf("timeout after %s", timeout)
+		case <-b.intr:
+			b.interrupted = true
+			return fmt.Errorf("interrupted")
 		}
 	}
 }
@@ -191,8 +236,13 @@ func (b *batch) stats() link.Stats {
 
 func runBatch(j *batchJob, cfg *config.Config, log *logx.Logger, out io.Writer, opts node.Options) int {
 	b := &batch{j: j, out: out, log: log}
+	intr, stop := batchSignals()
+	defer stop()
+	b.intr = intr
 	if cfg.Remote(j.node) == nil {
-		return b.fail(fmt.Sprintf("no remote node %s in the configuration", j.node))
+		// Batch mode dials the node itself: routed destinations are not
+		// supported (use the via node's name, or the interactive shell).
+		return b.fail(fmt.Sprintf("no remote node %s in the configuration (batch mode needs a direct link)", j.node))
 	}
 	// The general "timeout" shortens the signon window if it is smaller.
 	if t := time.Duration(cfg.Timeout) * time.Second; t > 0 && t < j.setup {
@@ -217,7 +267,13 @@ func runBatch(j *batchJob, cfg *config.Config, log *logx.Logger, out io.Writer, 
 	b.events = events
 	defer b.n.Stop() // closes the link WITHOUT signoff
 	if err := b.n.Listen(); err != nil {
-		b.say(fmt.Sprintf("cannot listen on %s:%d (%v); dialling only", cfg.LocalIP, cfg.LocalPort, err))
+		// The port is busy (usually the interactive gonje): dial only,
+		// and say who holds the port.
+		why := err.Error()
+		if j.cfgPath != "" {
+			why = instance.Diagnose(cfg, j.cfgPath, err)
+		}
+		b.say(fmt.Sprintf("cannot listen on %s:%d (%s); dialling only", cfg.LocalIP, cfg.LocalPort, why))
 	}
 	b.n.Start()
 	err := b.waitEvent(j.setup, func(ev link.Event) (bool, error) {
@@ -272,7 +328,7 @@ func (b *batch) cmd() int {
 	if got == 0 {
 		return b.fail(fmt.Sprintf("no response from %s within %s", b.j.node, b.j.wait))
 	}
-	if err != nil && !strings.HasPrefix(err.Error(), "timeout") {
+	if b.interrupted || (err != nil && !strings.HasPrefix(err.Error(), "timeout")) {
 		return b.fail(err.Error())
 	}
 	b.say(fmt.Sprintf("%d response line(s) from %s", got, b.j.node))

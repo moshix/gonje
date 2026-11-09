@@ -126,9 +126,11 @@ func boxedC(b Box, content Line, iw int, fc Color) Line {
 	return SegLine(segs...)
 }
 
-// paneHeights splits the inner rows of the split view into the top pane
-// (results + input line) and the events pane: from split_ratio, or the
-// size set with Ctrl-G/Ctrl-V, with at least minPane rows each.
+// paneHeights splits the rows left for the events pane and the command
+// pane (results + input line): the events pane gets split_ratio percent,
+// or the size set with Ctrl-G/Ctrl-V, with at least minPane rows each.
+// top is the command pane (now at the bottom of the screen), bottom the
+// events pane (now at the top); the names are kept from the old layout.
 func (s *Shell) paneHeights(inner int) (top, bottom int) {
 	bottom = inner * s.set.SplitRatio / 100
 	if s.bottomLines > 0 {
@@ -150,17 +152,17 @@ const msgFrameColor = BrightWhite
 type layout struct {
 	framed bool
 	msg    int // rows inside the messages box (0 = no box)
-	top    int // split: command pane rows incl. the input line
-	bottom int // split: events pane rows
+	top    int // split: command pane rows incl. the input line (bottom of screen)
+	bottom int // split: events pane rows (top of screen)
 	mixed  int // single pane: rows above the input line
 }
 
-// layoutFor computes the panes for rows x cols. Framed split view:
-// outer frame (title, command pane, divider, events, bottom border)
-// above the messages box (title border, msg rows, status border).
-// Framed single pane: outer frame with mixed pane + input line, then the
-// messages box. The messages box keeps s.msgLines rows (min 3) unless
-// the screen is too small for it.
+// layoutFor computes the panes for rows x cols. Framed, top to bottom:
+// a title line, the events box (split only), the white messages box and
+// the command box whose last content row is the input line and whose
+// bottom border holds the key hints. Every box costs two border rows.
+// The messages box keeps s.msgLines rows (min 3) unless the screen is
+// too small for it; then it is shrunk or left out.
 func (s *Shell) layoutFor(rows, cols int) layout {
 	l := layout{framed: s.framed(rows, cols)}
 	if !l.framed {
@@ -171,28 +173,28 @@ func (s *Shell) layoutFor(rows, cols int) layout {
 		}
 		return l
 	}
-	need := 3 // single: top border, input, bottom border (+1 mixed row)
+	// base: title line + command box borders (+ events box borders);
+	// panes: the fewest content rows the other boxes need.
+	base, panes := 3, 2
 	if s.split {
-		need = 3 + 2*minPane
-	} else {
-		need++
+		base, panes = 5, 2*minPane
 	}
 	m := max(s.msgLines, minPane)
-	if rows-(m+2) < need {
-		m = rows - need - 2 // shrink to fit
+	if rows-base-(m+2) < panes {
+		m = rows - base - 2 - panes // shrink to fit
 	}
 	if m < minPane {
 		m = 0 // no room: no messages box
 	}
 	l.msg = m
-	outer := rows
+	avail := rows - base
 	if m > 0 {
-		outer -= m + 2
+		avail -= m + 2
 	}
 	if s.split {
-		l.top, l.bottom = s.paneHeights(outer - 3)
+		l.top, l.bottom = s.paneHeights(avail)
 	} else {
-		l.mixed = outer - 3
+		l.mixed = avail - 1
 	}
 	return l
 }
@@ -229,11 +231,13 @@ const (
 	focusMessages = 2
 )
 
-// ToggleFocus moves the scroll focus to the next pane: commands, events,
-// messages in split view; single pane and messages otherwise.
+// ToggleFocus moves the scroll focus to the next pane, top to bottom:
+// events, messages, commands in split view; messages and the single
+// pane otherwise. The default focus is the command pane.
 func (s *Shell) ToggleFocus() {
 	if s.split {
-		s.focus = (s.focus + 1) % 3
+		next := map[int]int{focusEvents: focusMessages, focusMessages: focusCommands, focusCommands: focusEvents}
+		s.focus = next[s.focus]
 		return
 	}
 	if s.focus == focusMessages {
@@ -286,8 +290,7 @@ func (s *Shell) focusMark() string {
 	return "^v "
 }
 
-// title is the text of the top border; in split view it also labels the
-// command pane (highlighted when it has the scroll focus).
+// title is the text of the title line at the top of the screen.
 func (s *Shell) title() []Seg {
 	li := s.be.Local()
 	upColor := Green
@@ -306,15 +309,24 @@ func (s *Shell) title() []Seg {
 	if li.Draining > 0 {
 		segs = append(segs, Seg{d, frameColor}, Seg{fmt.Sprintf("%d draining", li.Draining), Yellow})
 	}
-	if s.split {
-		label := Seg{"commands", Dim}
-		if s.focus == focusCommands {
-			label = Seg{s.focusMark() + "commands", BoldYellow}
-		}
-		segs = append(segs, Seg{d, frameColor}, label)
-		if h := s.scrollHint(s.results); h != "" {
-			segs = append(segs, Seg{d, frameColor}, Seg{h, BoldYellow})
-		}
+	return segs
+}
+
+// cmdTitle labels the command box (highlighted when it has the scroll
+// focus) with its scroll position.
+func (s *Shell) cmdTitle() []Seg {
+	d := " " + s.box.Dot + " "
+	label := Seg{"commands", Dim}
+	if s.focus == focusCommands {
+		label = Seg{s.focusMark() + "commands", BoldYellow}
+	}
+	segs := []Seg{label}
+	p := s.results
+	if !s.split {
+		p = s.mixed
+	}
+	if h := s.scrollHint(p); h != "" {
+		segs = append(segs, Seg{d, frameColor}, Seg{h, BoldYellow})
 	}
 	return segs
 }
@@ -369,12 +381,17 @@ func (s *Shell) inputLine(w int) (Line, int) {
 // Render lays out the whole screen for a terminal of rows x cols:
 //
 //	split on                         split off
-//	┌─ gonje 0.2 · NODEA · 1/1 ─┐    ┌─ gonje 0.2 · NODEA · 1/1 ─┐
-//	│ command results           │    │ results and events,       │
-//	│ NODEA [1/1]> input_       │    │ interleaved               │
-//	├─ incoming · L2 · live ────┤    │ NODEA [1/1]> input_       │
-//	│ events                    │    └─ ^U/^D scroll  help ──────┘
-//	└─ ^G/^V resize  ^U/^D ... ─┘
+//	── gonje 0.6 · NODEA · 1/1 ───    ── gonje 0.6 · NODEA · 1/1 ───
+//	┌─ incoming · L2 · live ────┐    ┌─ messages · 3 ────────────┐
+//	│ events                    │    │ messages                  │
+//	└───────────────────────────┘    └───────────────────────────┘
+//	┌─ messages · 3 ────────────┐    ┌─ commands ────────────────┐
+//	│ messages (white frame)    │    │ results and events,       │
+//	└───────────────────────────┘    │ interleaved               │
+//	┌─ commands ────────────────┐    │ NODEA [1/1]> input_       │
+//	│ command results           │    └─ Tab focus  ^U/^D ... ────┘
+//	│ NODEA [1/1]> input_       │
+//	└─ Tab focus  ^G/^V ... ────┘
 //
 // Every row is exactly the usable width; text is clipped or wrapped to
 // the inner width so it can never overwrite the frame. Below 20x8 the
@@ -389,7 +406,7 @@ func (s *Shell) Render(rows, cols int) Frame {
 	iw := w - 2  // between the side borders
 	cw := iw - 2 // text width: one blank of padding on each side
 	s.width = cw
-	f := Frame{Rows: []Line{border(b, b.TL, b.TR, s.title(), w)}}
+	f := Frame{Rows: []Line{border(b, b.H, b.H, s.title(), w)}}
 	add := func(ls []Line) {
 		for _, l := range ls {
 			f.Rows = append(f.Rows, boxed(b, l, iw))
@@ -397,37 +414,30 @@ func (s *Shell) Render(rows, cols int) Frame {
 	}
 	l := s.layoutFor(rows, cols)
 	if s.split {
-		add(s.results.Visible(l.top-1, cw))
-		in, col := s.inputLine(cw)
-		f.CursorRow, f.CursorCol = len(f.Rows), 2+col
-		add([]Line{in})
-		f.Rows = append(f.Rows, border(b, b.LT, b.RT, s.dividerTitle(l.bottom), w))
+		f.Rows = append(f.Rows, border(b, b.TL, b.TR, s.dividerTitle(l.bottom), w))
 		add(s.events.Visible(l.bottom, cw))
+		f.Rows = append(f.Rows, border(b, b.BL, b.BR, nil, w))
+	}
+	if l.msg > 0 {
+		f.Rows = append(f.Rows, borderC(b, b.TL, b.TR, s.msgTitle(), w, msgFrameColor))
+		now := s.now()
+		for _, ml := range s.msgs.Visible(l.msg, cw) {
+			f.Rows = append(f.Rows, boxedC(b, s.blinkTag(ml, now), iw, msgFrameColor))
+		}
+		f.Rows = append(f.Rows, borderC(b, b.BL, b.BR, nil, w, msgFrameColor))
+	}
+	// The command box at the bottom: results (or the mixed pane), the
+	// input line, and the key hints in its bottom border.
+	f.Rows = append(f.Rows, border(b, b.TL, b.TR, s.cmdTitle(), w))
+	if s.split {
+		add(s.results.Visible(l.top-1, cw))
 	} else {
 		add(s.mixed.Visible(l.mixed, cw))
-		in, col := s.inputLine(cw)
-		f.CursorRow, f.CursorCol = len(f.Rows), 2+col
-		add([]Line{in})
 	}
-	hint := s.hints()
-	if !s.split {
-		if h := s.scrollHint(s.mixed); h != "" {
-			hint = append([]Seg{{h, BoldYellow}, {"  ", Default}}, hint...)
-		}
-	}
-	if l.msg == 0 {
-		f.Rows = append(f.Rows, border(b, b.BL, b.BR, hint, w))
-		return f
-	}
-	// Close the outer frame, then the white messages box with the
-	// status hints in its bottom border.
-	f.Rows = append(f.Rows, border(b, b.BL, b.BR, nil, w))
-	f.Rows = append(f.Rows, borderC(b, b.TL, b.TR, s.msgTitle(), w, msgFrameColor))
-	now := s.now()
-	for _, ml := range s.msgs.Visible(l.msg, cw) {
-		f.Rows = append(f.Rows, boxedC(b, s.blinkTag(ml, now), iw, msgFrameColor))
-	}
-	f.Rows = append(f.Rows, borderC(b, b.BL, b.BR, hint, w, msgFrameColor))
+	in, col := s.inputLine(cw)
+	f.CursorRow, f.CursorCol = len(f.Rows), 2+col
+	add([]Line{in})
+	f.Rows = append(f.Rows, border(b, b.BL, b.BR, s.hints(), w))
 	return f
 }
 
@@ -491,24 +501,37 @@ func (s *Shell) msgTitle() []Seg {
 	return segs
 }
 
-// renderBare is the frameless layout for tiny terminals.
+// renderBare is the frameless layout for tiny terminals, in the same
+// order as the framed one: events, messages (when there are any and the
+// screen has 6 rows or more), then the results and the input line.
 func (s *Shell) renderBare(rows, w int) Frame {
 	s.width = w
 	var f Frame
+	divider := Line{Text: strings.Repeat(s.box.H, w), Color: frameColor}
+	m := 0 // message rows (plus one divider row)
+	if rows >= 6 && s.msgs.Len() > 0 {
+		m = max(1, min(3, rows/4))
+		rows -= m + 1
+	}
+	msgs := func() {
+		if m > 0 {
+			f.Rows = append(f.Rows, s.msgs.Visible(m, w)...)
+			f.Rows = append(f.Rows, divider)
+		}
+	}
 	if s.split && rows >= 5 {
 		top, bottom := s.paneHeights(rows - 1)
-		f.Rows = append(f.Rows, s.results.Visible(top-1, w)...)
-		in, col := s.inputLine(w)
-		f.CursorRow, f.CursorCol = len(f.Rows), col
-		f.Rows = append(f.Rows, in)
-		f.Rows = append(f.Rows, Line{Text: strings.Repeat(s.box.H, w), Color: frameColor})
 		f.Rows = append(f.Rows, s.events.Visible(bottom, w)...)
+		f.Rows = append(f.Rows, divider)
+		msgs()
+		f.Rows = append(f.Rows, s.results.Visible(top-1, w)...)
 	} else {
+		msgs()
 		f.Rows = append(f.Rows, s.mixed.Visible(rows-1, w)...)
-		in, col := s.inputLine(w)
-		f.CursorRow, f.CursorCol = len(f.Rows), col
-		f.Rows = append(f.Rows, in)
 	}
+	in, col := s.inputLine(w)
+	f.CursorRow, f.CursorCol = len(f.Rows), col
+	f.Rows = append(f.Rows, in)
 	for i := range f.Rows {
 		f.Rows[i] = fitLine(f.Rows[i], w)
 	}

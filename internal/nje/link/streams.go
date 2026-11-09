@@ -38,9 +38,10 @@ type txState struct {
 	rcb      byte // stream RCB of this slot
 	state    txPhase
 	f        *OutboundFile
-	next     int       // next record index to send
-	since    time.Time // when the current wait started
-	reported int       // last progress quarter reported
+	next     int              // next record index to send
+	pend     []records.Record // segments of a spanned record still to send
+	since    time.Time        // when the current wait started
+	reported int              // last progress quarter reported
 }
 
 // initTx creates the outbound slots.
@@ -125,29 +126,27 @@ func (s *Session) txStep(t *txState) []records.Record {
 	case txData:
 		var recs []records.Record
 		size := 6 // DLE STX BCB FCS(2) + EOB
-		for t.next < len(t.f.Records) {
-			// SYSOUT data SRCB 10cc0000: cc = carriage control kind. The
-			// record starts with its 1-byte length (LRECL incl. the CC
-			// byte), as in figs 20/21 of the manual; spec 02 AMBIG-2 left
-			// open whether BSC/TCP carries it, and the NJE38 trace on
-			// 2026-11-09 settled it: NJE38 sends "50 <80 bytes>" and its
-			// receiver reads byte 0 as the length (DMTXJE PDATAREC
-			// "Don't count length byte"), so without it HOUCICS lost the
-			// first character of every line.
-			rec := t.f.Records[t.next]
-			data := append([]byte{byte(len(rec))}, rec...)
-			r := records.Record{RCB: t.rcb, SRCB: records.SRCBData | t.f.CC<<4, Data: data}
+		sent := 0
+		for {
+			if len(t.pend) == 0 {
+				if t.next >= len(t.f.Records) {
+					break
+				}
+				t.pend = s.dataRecords(t.rcb, t.f.CC, t.f.Records[t.next])
+				t.next++
+				sent++
+			}
+			r := t.pend[0]
 			n := records.EncodedSize(r)
 			if len(recs) > 0 && size+n > s.bufLimit {
 				break
 			}
 			recs, size = append(recs, r), size+n
-			t.next++
+			t.pend = t.pend[1:]
 		}
-		sent := len(recs)
 		s.count(func(st *Stats) { st.RecordsOut += sent })
 		s.txProgress(t)
-		if t.next >= len(t.f.Records) {
+		if t.next >= len(t.f.Records) && len(t.pend) == 0 {
 			t.state = txTrailer
 		}
 		if len(recs) == 0 {
@@ -572,4 +571,67 @@ func (s *Session) rxComplete(st *rxStream) {
 		})
 		s.p.Handler.Dataset(s.p.Remote, ds)
 	}
+}
+
+// dataRecords encodes one logical SYSOUT record (SRCB 10cc ss00, cc =
+// carriage control kind).
+//
+// A record that fits is sent whole (ss = 00) and starts with its 1-byte
+// length (LRECL incl. the CC byte), as in figs 20/21 of the manual; spec
+// 02 AMBIG-2 left open whether BSC/TCP carries it, and the NJE38 trace on
+// 2026-11-09 settled it: NJE38 sends "50 <80 bytes>" and its receiver
+// reads byte 0 as the length (DMTXJE PDATAREC "Don't count length
+// byte"), so without it HOUCICS lost the first character of every line.
+//
+// That length is one byte, so a record of 256 bytes or more (forwarded
+// files carry whatever was received), or one too big for a buffer, is
+// sent spanned like rxData rebuilds it: first segment SEGL(1) LRECL(2)
+// data (ss = 10), then SEGL(1) data (01 middle, 11 last).
+func (s *Session) dataRecords(rcb, cc byte, rec []byte) []records.Record {
+	srcb := records.SRCBData | cc<<4
+	if len(rec) <= 255 {
+		r := records.Record{RCB: rcb, SRCB: srcb, Data: append([]byte{byte(len(rec))}, rec...)}
+		if records.EncodedSize(r)+6 <= s.bufLimit {
+			return []records.Record{r}
+		}
+	}
+	if len(rec) > maxSpanned {
+		s.log.Warn(fmt.Sprintf("record of %d bytes cut to %d", len(rec), maxSpanned))
+		rec = rec[:maxSpanned]
+	}
+	// Segment size: at most 255 (SEGL is one byte) and small enough that
+	// a segment (worst case after compression) fits an empty buffer.
+	seg := 255
+	for seg > 16 && records.EncodedSize(records.Record{RCB: rcb, Data: make([]byte, seg+3)})+6 > s.bufLimit {
+		seg -= 16
+	}
+	var out []records.Record
+	for off := 0; off < len(rec); off += seg {
+		part := rec[off:min(off+seg, len(rec))]
+		var data []byte
+		var ss byte
+		switch {
+		case off == 0:
+			ss = 0x08 // first
+			data = append([]byte{byte(len(part)), byte(len(rec) >> 8), byte(len(rec))}, part...)
+		case off+seg >= len(rec):
+			ss = 0x0C // last
+			data = append([]byte{byte(len(part))}, part...)
+		default:
+			ss = 0x04 // middle
+			data = append([]byte{byte(len(part))}, part...)
+		}
+		out = append(out, records.Record{RCB: rcb, SRCB: srcb | ss, Data: data})
+	}
+	if len(out) == 1 {
+		// A record that needs spanning but fits one segment: first+last
+		// in one (the receiver needs a last segment), so split it.
+		part := rec
+		half := len(part) / 2
+		out = []records.Record{
+			{RCB: rcb, SRCB: srcb | 0x08, Data: append([]byte{byte(half), byte(len(rec) >> 8), byte(len(rec))}, part[:half]...)},
+			{RCB: rcb, SRCB: srcb | 0x0C, Data: append([]byte{byte(len(part) - half)}, part[half:]...)},
+		}
+	}
+	return out
 }
