@@ -27,6 +27,12 @@ func TestReadmeHasEveryKey(t *testing.T) {
 		if !strings.Contains(string(b), "`"+k+"`") {
 			t.Errorf("README.md does not document %s", k)
 		}
+		if !IsKey(k) {
+			t.Errorf("%s missing from Keys", k)
+		}
+	}
+	if len(Keys) != len(readmeKeys) || IsKey("remote_hst_port") || !IsKey("Remote-Max-Streams") {
+		t.Error("Keys out of step with the loader")
 	}
 	cfg, err := Parse(strings.NewReader(sampleAllKeys))
 	if err != nil {

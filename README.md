@@ -67,20 +67,48 @@ remote.
 
 ## Run
 
-    ./gonje [-c|-f gonje.cnf] [-split=true|false] [-log gonje.log]
+    ./gonje [-c|-f gonje.cnf] [-o key=value ...] [-split=true|false] [-log gonje.log]
 
 | Flag | Meaning |
 |---|---|
 | `-c <file>`, `-f <file>` | config file (gonje.cnf); `-c send\|cmd\|msg` selects batch mode |
+| `-o key=value ...` | gonje.cnf keys (quotes optional); repeatable |
 | `-split=false` | start with a single pane (default from `split_view`) |
 | `-log <file>` | log file (gonje.log) |
 | `-v` | print `gonje <version>` and exit |
 | `-w <s>` | batch `cmd`: seconds to wait for responses (30) |
 
+`-o` takes the same `key=value` tokens as gonje.cnf (separated by
+spaces or commas; `remote_host_name` starts a remote block):
+
+    gonje -o local_node=MOSHIX local_IP=10.157.58.220 local_port=1750 remote_host_name=HOUCICS remote_host_addr=10.157.58.220 remote_host_port=4002
+    gonje -o local_node=MOSHIX remote_host_name=HOUCICS remote_host_addr=10.157.58.220 -c msg HOUCICS HERC01 hello
+
+- `-o` takes every following `key=value` argument up to the next
+  argument that starts with `-` or has no `=`. It may come before or
+  after other flags, and after `-c send|cmd|msg` and its operands.
+- A token with an unknown key (a typo) is an error.
+- Quotes are optional; they only group several tokens into one
+  argument, e.g. `-o "local_node=ME remote_host_name=A"`. Values can't
+  contain spaces (spaces separate tokens, as in gonje.cnf).
+- In batch mode the message or command text must not contain a word
+  starting with `-` (it would be read as the next option).
+
+- With `-o`, gonje.cnf is optional (but a file named with `-c`/`-f`
+  must exist).
+- If there is a config file, `-o` is applied after it: values override,
+  a remote named again is extended, a new one is added.
+- Errors name `-o` as their source.
+- Started without a config file, the first `save` in the shell writes a
+  new gonje.cnf (the `-o` settings plus the change).
+- Passwords in `-o` are masked in the log, but they are visible in `ps`
+  and your shell history.
+
 Only one interactive gonje runs per config file. `gonje.pid` next to the
 config holds the pid, version, node, listen address, config path and
 start time. It is removed on exit, and a stale one (process gone) is
-cleaned up. When the listen port is busy, gonje says who has it: another
+cleaned up. Without a config file it goes in the current directory, and
+"same config" means the same local node and listen address. When the listen port is busy, gonje says who has it: another
 gonje (pid, node, start time), an NJE node that answers an OPEN probe,
 or another program. It also points out a remote node configured on the
 same port.
@@ -268,8 +296,13 @@ split). Binary files go as punch files (80-byte records).
 
 ## Batch mode
 
-One action, then exit. There is no screen; progress and responses go
-to stderr.
+One action, then exit. There is no screen. Batch mode is quiet: the
+result of `cmd` (the response text, one line per response line) goes to
+stdout, and only errors go to stderr. Add `-verbose` to also see progress
+and other incoming traffic on stderr. Everything is logged. With `-o` no
+gonje.cnf is needed (`local_node` is required):
+
+    gonje -o local_node=MOSHIX remote_host_name=HOUCICS remote_host_addr=10.157.58.220 remote_host_port=4002 -c cmd HOUCICS D T > result.txt
 
     gonje -c send file.txt NODEID USERID
     gonje -c cmd NODEID cp q users       # waits for responses (-w <s>, 30)

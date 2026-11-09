@@ -143,6 +143,9 @@ func job(mode string, args ...string) *batchJob {
 }
 
 func TestBatchEndToEnd(t *testing.T) {
+	// These checks read the progress lines, which need -verbose.
+	batchVerbose = true
+	defer func() { batchVerbose = false }()
 	b, recv, bev := peer(t)
 	cfg := batchCfg(t, b.Addr().String())
 	opts := node.Options{User: "ALICE", Handshake: 3 * time.Second}
@@ -170,14 +173,18 @@ func TestBatchEndToEnd(t *testing.T) {
 		t.Fatal("file not byte-exact")
 	}
 
-	// cmd: the auto-answer comes back on stderr.
+	// cmd: the response text is the result and goes to stdout (without
+	// the "from NODEB to USER: " prefix); the progress lines stay on stderr.
 	out.Reset()
+	var res bytes.Buffer
+	batchStdout = &res
+	defer func() { batchStdout = os.Stdout }()
 	if rc := runBatch(job("cmd", "NODEB", "Q", "SYS"), cfg, logx.Discard(), &out, opts); rc != 0 {
 		t.Fatalf("cmd rc %d:\n%s", rc, out.String())
 	}
-	if !strings.Contains(out.String(), "NODEB: from NODEB") || !strings.Contains(out.String(), "NJE node") ||
-		!strings.Contains(out.String(), "response line(s) from NODEB") {
-		t.Fatalf("cmd output:\n%s", out.String())
+	if !strings.Contains(res.String(), "NJE node") || strings.Contains(res.String(), "from NODEB") ||
+		!strings.Contains(out.String(), "response line(s) from NODEB") || strings.Contains(out.String(), "NJE node") {
+		t.Fatalf("cmd stdout:\n%s\nstderr:\n%s", res.String(), out.String())
 	}
 
 	// msg
@@ -296,6 +303,9 @@ func freePort(t *testing.T) int {
 // TestBatchPeerDialsUs: the peer NAKs our OPEN with 03 (or ACKs it and
 // stays silent) and calls us instead; batch mode accepts that call.
 func TestBatchPeerDialsUs(t *testing.T) {
+	// These checks read the progress lines, which need -verbose.
+	batchVerbose = true
+	defer func() { batchVerbose = false }()
 	answers := map[string]func(net.Conn){
 		"NAK 03": func(c net.Conn) {
 			c.Write((&tcpip.Control{Type: tcpip.TypeNAK, RHost: "NODEB", OHost: "NODEA", Reason: tcpip.NAKCollision}).Marshal())
@@ -349,6 +359,9 @@ func TestBatchInterrupted(t *testing.T) {
 // TestBatchCountsOnlyResponses: an unsolicited message from the node is
 // shown but does not count as a command response (second review m5).
 func TestBatchCountsOnlyResponses(t *testing.T) {
+	// These checks read the progress lines, which need -verbose.
+	batchVerbose = true
+	defer func() { batchVerbose = false }()
 	var out bytes.Buffer
 	b := &batch{j: &batchJob{node: "NODEB"}, out: &out, log: logx.Discard()}
 	b.show(link.Event{Kind: link.EvMsgIn, Node: "NODEB", Text: "Signon of link NODEA complete"})
@@ -358,5 +371,125 @@ func TestBatchCountsOnlyResponses(t *testing.T) {
 	b.show(link.Event{Kind: link.EvRspIn, Node: "NODEB", Text: "from NODEB: answer"})
 	if b.got != 1 {
 		t.Fatal("response not counted")
+	}
+}
+
+// TestOptionFlag: -o is repeatable, keeps the batch syntax working, and
+// -c/-f mark the config file as explicit.
+func TestOptionFlag(t *testing.T) {
+	o, err := parseArgs([]string{"-o", "local_node=A remote_host_name=B", "-o", "remote_host_port=9",
+		"-c", "msg", "HOUCICS", "HERC01", "hello"}, io.Discard)
+	if err != nil || len(o.opts) != 2 || o.mode != "msg" || o.explicit || o.config != "gonje.cnf" {
+		t.Fatalf("%+v %v", o, err)
+	}
+	if o, _ := parseArgs([]string{"-f", "x.cnf", "-o", "local_node=A"}, io.Discard); !o.explicit || o.config != "x.cnf" {
+		t.Fatalf("%+v", o)
+	}
+	if s := configInit(false, []string{"local_node=A remote_host_name=B", "remote_host_port=9"}); !strings.Contains(s, "local_node=A remote_host_name=B\nremote_host_port=9\n") {
+		t.Fatalf("%q", s)
+	}
+	if configInit(true, []string{"x=1"}) != "" {
+		t.Fatal("init text with a config file")
+	}
+}
+
+// TestBatchWithOptions: gonje -o "..." -c msg works with no gonje.cnf.
+func TestBatchWithOptions(t *testing.T) {
+	b, _, bev := peer(t)
+	host, port, _ := net.SplitHostPort(b.Addr().String())
+	o, err := parseArgs([]string{"-o", "local_node=NODEA local_IP=127.0.0.1 local_port=" + strconv.Itoa(freePort(t)) + " recv_dir=" + t.TempDir() +
+		" remote_host_name=NODEB remote_host_addr=" + host + " remote_host_port=" + port,
+		"-c", "msg", "NODEB", "BOB", "hello", "from", "options"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, hasFile, err := config.LoadWithOptions(filepath.Join(t.TempDir(), o.config), o.explicit, o.opts)
+	if err != nil || hasFile {
+		t.Fatalf("%v %v", hasFile, err)
+	}
+	j, err := newBatchJob(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.grace, j.setup = 200*time.Millisecond, 10*time.Second
+	var out bytes.Buffer
+	if rc := runBatch(j, cfg, logx.Discard(), &out, node.Options{User: "ALICE", Handshake: 3 * time.Second}); rc != 0 {
+		t.Fatalf("rc %d:\n%s", rc, out.String())
+	}
+	waitFor(t, bev, link.EvMsgIn, "hello from options")
+}
+
+// TestUnquotedOptions: -o without quotes, before other flags, before
+// and after -c with its operands, split on commas; a typo is an error.
+func TestUnquotedOptions(t *testing.T) {
+	cases := []struct {
+		args []string
+		opts []string
+		mode string
+		rest []string
+	}{
+		{[]string{"-o", "local_node=X", "remote_host_name=Y", "remote_host_addr=h", "remote_host_port=175", "-split=false"},
+			[]string{"local_node=X", "remote_host_name=Y", "remote_host_addr=h", "remote_host_port=175"}, "", nil},
+		{[]string{"-o", "local_node=X", "remote_host_name=Y", "remote_host_addr=h", "-c", "msg", "Y", "HERC01", "hello", "how", "are", "you?"},
+			[]string{"local_node=X", "remote_host_name=Y", "remote_host_addr=h"}, "msg", []string{"Y", "HERC01", "hello", "how", "are", "you?"}},
+		{[]string{"-c", "msg", "Y", "HERC01", "hello", "-o", "local_node=X", "Remote-Host-Name=Y"},
+			[]string{"local_node=X", "Remote-Host-Name=Y"}, "msg", []string{"Y", "HERC01", "hello"}},
+		{[]string{"--o", "local_node=X,remote_host_name=Y", "-o", "route=FAR,Y local_port=1750"},
+			[]string{"local_node=X,remote_host_name=Y", "route=FAR,Y local_port=1750"}, "", nil},
+	}
+	for _, c := range cases {
+		o, err := parseArgs(c.args, io.Discard)
+		if err != nil {
+			t.Fatalf("%q: %v", c.args, err)
+		}
+		if strings.Join(o.opts, "|") != strings.Join(c.opts, "|") || o.mode != c.mode || strings.Join(o.args, " ") != strings.Join(c.rest, " ") {
+			t.Fatalf("%q: opts %q mode %q args %q", c.args, o.opts, o.mode, o.args)
+		}
+		if c.mode == "" && len(c.args) > 5 && (!o.split.set || o.split.val) {
+			t.Fatalf("%q: -split=false lost", c.args)
+		}
+	}
+	// The unquoted form loads like the quoted one.
+	o, _ := parseArgs(cases[0].args, io.Discard)
+	cfg, _, err := config.LoadWithOptions(filepath.Join(t.TempDir(), "gonje.cnf"), false, o.opts)
+	if err != nil || cfg.LocalNode != "X" || cfg.Remote("Y").Addr != "h" {
+		t.Fatalf("%v", err)
+	}
+	// A typo is an error naming the token, never the end of -o.
+	for args, want := range map[string]string{
+		"-o local_node=X remote_hst_port=1": `-o: unknown key in "remote_hst_port=1"`,
+		"-o local_node=X,bogus_key=2":       `-o: unknown key in "bogus_key=2"`,
+		"-o -split=false":                   "-o needs key=value tokens",
+		"-o remote_password=x typo=1":       `-o: unknown key in "typo=1"`,
+	} {
+		if _, err := parseArgs(strings.Fields(args), io.Discard); err == nil || err.Error() != want {
+			t.Errorf("%q: %v, want %s", args, err, want)
+		}
+	}
+}
+
+// TestBatchQuietByDefault: without -verbose a cmd job prints only the
+// response text on stdout and nothing at all on stderr.
+func TestBatchQuietByDefault(t *testing.T) {
+	b, _, _ := peer(t)
+	cfg := batchCfg(t, b.Addr().String())
+	opts := node.Options{User: "ALICE", Handshake: 3 * time.Second}
+	var stderr, stdout bytes.Buffer
+	batchStdout = &stdout
+	defer func() { batchStdout = os.Stdout }()
+	if rc := runBatch(job("cmd", "NODEB", "Q", "SYS"), cfg, logx.Discard(), &stderr, opts); rc != 0 {
+		t.Fatalf("cmd rc %d:\n%s", rc, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr not empty:\n%s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "NJE node") || strings.Contains(stdout.String(), "gonje:") {
+		t.Fatalf("stdout:\n%s", stdout.String())
+	}
+	// Errors are still printed.
+	stderr.Reset()
+	if rc := runBatch(job("cmd", "NOSUCH", "Q", "SYS"), cfg, logx.Discard(), &stderr, opts); rc != 1 ||
+		!strings.Contains(stderr.String(), "gonje: error: ") {
+		t.Fatalf("rc %d stderr %q", rc, stderr.String())
 	}
 }

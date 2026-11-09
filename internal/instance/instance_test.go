@@ -143,3 +143,35 @@ func TestDiagnose(t *testing.T) {
 		t.Fatal("plain listener taken for NJE")
 	}
 }
+
+// TestPidWithoutConfigFile: with -o only, gonje.pid goes to the current
+// directory and "same config" means same local node and listen address.
+func TestPidWithoutConfigFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if PidPath("") != PidFile {
+		t.Fatal(PidPath(""))
+	}
+	cfg := config.Defaults()
+	cfg.LocalNode, cfg.LocalIP, cfg.LocalPort = "MOSHIX", "10.157.58.220", 1750
+	me := NewInfo("9.9", cfg, "")
+	if me.Config != "" {
+		t.Fatalf("config %q", me.Config)
+	}
+	l, _, err := Acquire("", me)
+	if err != nil || l == nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	if _, err := os.Stat(PidFile); err != nil {
+		t.Fatal("no gonje.pid in the current directory")
+	}
+	other := me
+	other.PID = os.Getpid() + 1
+	if _, _, err := Acquire("", other); err == nil || !strings.Contains(err.Error(), "on 10.157.58.220:1750") {
+		t.Fatalf("same node+listen not refused: %v", err)
+	}
+	other.Node = "OTHER"
+	if l2, _, err := Acquire("", other); err != nil || l2 != nil {
+		t.Fatalf("another node: %v %v", l2, err)
+	}
+}

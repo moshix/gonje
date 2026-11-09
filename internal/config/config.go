@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -85,14 +86,27 @@ func Load(path string) (*Config, error) {
 	return Parse(f)
 }
 
-// token is one key=value item plus its line number for error messages.
+// token is one key=value item plus where it came from, for error
+// messages: a line of the config file, or (src "-o") the command line.
 type token struct {
 	key, val string
 	line     int
+	src      string // "" = config file, "-o" = command line option
+}
+
+// where names a token's source in messages: "line 7" or "-o".
+func (t token) where() string {
+	if t.src != "" {
+		return t.src
+	}
+	return fmt.Sprintf("line %d", t.line)
 }
 
 // tokenize splits the input into key=value tokens, dropping comments.
-func tokenize(r io.Reader) ([]token, error) {
+func tokenize(r io.Reader) ([]token, error) { return tokenizeSrc(r, "") }
+
+// tokenizeSrc is tokenize with the source of the text ("" or "-o").
+func tokenizeSrc(r io.Reader, src string) ([]token, error) {
 	var toks []token
 	sc := bufio.NewScanner(r)
 	ln := 0
@@ -113,11 +127,11 @@ func tokenize(r io.Reader) ([]token, error) {
 				continue
 			}
 			if !ok || k == "" {
-				return nil, fmt.Errorf("line %d: expected key=value, got %q", ln, f)
+				return nil, fmt.Errorf("%s: expected key=value, got %q", token{line: ln, src: src}.where(), f)
 			}
 			// Keys are case-insensitive and '-' is accepted for '_'
 			// (e.g. remote_max-streams).
-			toks = append(toks, token{normKey(k), v, ln})
+			toks = append(toks, token{normKey(k), v, ln, src})
 		}
 	}
 	return toks, sc.Err()
@@ -132,12 +146,27 @@ func Parse(r io.Reader) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c, err := build(toks)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// build applies tokens in order to the defaults (no validation).
+// remote_host_name starts a new remote block, except that in -o tokens
+// it continues the block of a remote that already exists (so -o can
+// change a remote of the config file).
+func build(toks []token) (*Config, error) {
 	c := Defaults()
 	var cur *Remote
 	for _, t := range toks {
-		bad := func(e error) error { return fmt.Errorf("line %d: %s: %v", t.line, t.key, e) }
+		bad := func(e error) error { return fmt.Errorf("%s: %s: %v", t.where(), t.key, e) }
 		if strings.HasPrefix(t.key, "remote_") && t.key != "remote_host_name" && cur == nil {
-			return nil, fmt.Errorf("line %d: %s before remote_host_name", t.line, t.key)
+			return nil, fmt.Errorf("%s: %s before remote_host_name", t.where(), t.key)
 		}
 		switch t.key {
 		case "local_node":
@@ -219,6 +248,12 @@ func Parse(r io.Reader) (*Config, error) {
 			if err != nil {
 				return nil, bad(err)
 			}
+			if t.src != "" {
+				if r := c.Remote(n); r != nil {
+					cur = r // -o continues an existing remote's block
+					continue
+				}
+			}
 			cur = &Remote{Name: n, Port: 175, Keepalive: 10}
 			c.Remotes = append(c.Remotes, cur)
 		case "remote_host_addr":
@@ -283,13 +318,51 @@ func Parse(r io.Reader) (*Config, error) {
 			cur.Password = pw
 		default:
 			c.Warnings = append(c.Warnings,
-				fmt.Sprintf("config line %d: unknown key %q ignored", t.line, t.key))
+				fmt.Sprintf("config %s: unknown key %q ignored", t.where(), t.key))
 		}
 	}
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
 	return c, nil
+}
+
+// LoadWithOptions reads the config file at path (if it exists, or
+// always when required) and then applies the -o option strings, in
+// order, as if they followed the file: later values override, a remote
+// named again in -o is extended, new remotes are added. The result is
+// validated as a whole; a failure that only the -o tokens cause names
+// "-o". hasFile reports whether a config file was read.
+func LoadWithOptions(path string, required bool, opts []string) (c *Config, hasFile bool, err error) {
+	var toks []token
+	b, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		hasFile = true
+		if toks, err = tokenize(strings.NewReader(string(b))); err != nil {
+			return nil, true, err
+		}
+		// The file must be valid on its own (the shell saves to it).
+		if _, err := Parse(strings.NewReader(string(b))); err != nil {
+			return nil, true, err
+		}
+	case required || len(opts) == 0 || !os.IsNotExist(err):
+		return nil, false, err
+	}
+	for _, o := range opts {
+		ot, err := tokenizeSrc(strings.NewReader(o), "-o")
+		if err != nil {
+			return nil, hasFile, err
+		}
+		toks = append(toks, ot...)
+	}
+	if c, err = build(toks); err != nil {
+		return nil, hasFile, err
+	}
+	if err := c.validate(); err != nil {
+		if len(opts) > 0 {
+			err = fmt.Errorf("-o: %w", err)
+		}
+		return nil, hasFile, err
+	}
+	return c, hasFile, nil
 }
 
 func (c *Config) validate() error {
@@ -563,4 +636,32 @@ func boolean(s string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("%q is not yes/no", s)
+}
+
+// secretRE matches password=<value> and remote_password=<value> (any
+// case, '-' for '_') as a word of a command line or -o string.
+var secretRE = regexp.MustCompile(`(^|[\s,])((?i:remote[_-]password|password)=)[^\s,]*`)
+
+// MaskSecrets replaces password values with "***" (for logs, history and
+// echoed commands).
+func MaskSecrets(line string) string {
+	return secretRE.ReplaceAllString(line, "${1}${2}***")
+}
+
+// Keys lists every key the loader accepts (normalized: lower case, '_').
+var Keys = []string{"local_node", "local_ip", "local_port", "send_dir", "recv_dir", "log_level",
+	"panel_level", "split_view", "split_ratio", "msg_pane", "msg_bell", "timeout", "route", "default_route",
+	"remote_host_name", "remote_host_addr", "remote_host_port", "remote_keepalive", "remote_password",
+	"remote_turn", "remote_buffersize", "remote_max_streams", "remote_line", "remote_natin",
+	"remote_natout", "remote_strict_bcb"}
+
+// IsKey reports whether k is a config key (any case, '-' for '_').
+func IsKey(k string) bool {
+	k = normKey(k)
+	for _, x := range Keys {
+		if x == k {
+			return true
+		}
+	}
+	return false
 }

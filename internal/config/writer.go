@@ -50,6 +50,16 @@ func OpenFile(path string) (*File, error) {
 	return f, nil
 }
 
+// NewFile starts a config file that does not exist yet with text (Save
+// creates it, mode 0644, or 0600 when it holds a password).
+func NewFile(path, text string) *File {
+	f := &File{Path: path, mode: 0o644, nl: true}
+	if text != "" {
+		f.lines = strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	}
+	return f
+}
+
 // Bytes returns the edited file content.
 func (f *File) Bytes() []byte {
 	lines := f.lines

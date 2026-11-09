@@ -34,12 +34,21 @@ type Info struct {
 	Started time.Time
 }
 
-// PidPath returns the pid file path for a config file.
-func PidPath(cfgPath string) string { return filepath.Join(filepath.Dir(absPath(cfgPath)), PidFile) }
+// PidPath returns the pid file path for a config file; without one
+// (cfgPath "": everything given with -o) it is in the current directory.
+func PidPath(cfgPath string) string {
+	if cfgPath == "" {
+		return PidFile
+	}
+	return filepath.Join(filepath.Dir(absPath(cfgPath)), PidFile)
+}
 
 // absPath is the absolute, symlink-free form of p (as far as it exists),
 // so two spellings of the same config file compare equal.
 func absPath(p string) string {
+	if p == "" {
+		return ""
+	}
 	a, err := filepath.Abs(p)
 	if err != nil {
 		return p
@@ -55,7 +64,8 @@ func ListenAddr(cfg *config.Config) string {
 	return net.JoinHostPort(cfg.LocalIP, strconv.Itoa(cfg.LocalPort))
 }
 
-// NewInfo describes this process for cfg loaded from cfgPath.
+// NewInfo describes this process for cfg loaded from cfgPath ("" = no
+// config file, only -o options).
 func NewInfo(version string, cfg *config.Config, cfgPath string) Info {
 	return Info{PID: os.Getpid(), Version: version, Node: cfg.LocalNode, Listen: ListenAddr(cfg),
 		Config: absPath(cfgPath), Started: time.Now()}
@@ -152,7 +162,7 @@ func Acquire(cfgPath string, info Info) (l *Lock, stale *Info, err error) {
 		old, rerr := Read(path)
 		switch {
 		case rerr == nil && old.PID != info.PID && Alive(old.PID):
-			if old.Config == "" || old.Config == info.Config {
+			if sameInstance(old, &info) {
 				return nil, stale, &ErrRunning{Info: old}
 			}
 			return nil, stale, nil // another config's instance
@@ -165,6 +175,16 @@ func Acquire(cfgPath string, info Info) (l *Lock, stale *Info, err error) {
 		}
 	}
 	return nil, stale, fmt.Errorf("%s: cannot create the pid file", path)
+}
+
+// sameInstance reports whether a running gonje has "this config": the
+// same config file, or, when either runs without one (-o only), the
+// same local node and listen address.
+func sameInstance(old, me *Info) bool {
+	if old.Config != "" && me.Config != "" {
+		return old.Config == me.Config
+	}
+	return strings.EqualFold(old.Node, me.Node) && old.Listen == me.Listen
 }
 
 // Release removes the pid file if it is still ours. Safe on nil.
@@ -187,7 +207,7 @@ func Diagnose(cfg *config.Config, cfgPath string, bindErr error) string {
 	}
 	var msg string
 	if i, err := Read(PidPath(cfgPath)); err == nil && i.PID != os.Getpid() && Alive(i.PID) &&
-		(i.Config == absPath(cfgPath) || i.Listen == addr) {
+		((i.Config != "" && i.Config == absPath(cfgPath)) || i.Listen == addr) {
 		msg = i.Running()
 	} else if ProbeNJE(addr, cfg.LocalNode, 2*time.Second) {
 		msg = fmt.Sprintf("an NJE node (probably another gonje or NJE server) is listening on %s", addr)

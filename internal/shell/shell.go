@@ -44,8 +44,11 @@ type Backend interface {
 
 // Settings are the shell's static parameters.
 type Settings struct {
-	Version     string
-	ConfigPath  string // file that "save" writes to (-c)
+	Version    string
+	ConfigPath string // file that "save" writes to (-c)
+	// ConfigInit: gonje runs without a config file (-o only); the first
+	// "save" creates ConfigPath from this text, then applies the edit.
+	ConfigInit  string
 	SendDir     string
 	RecvDir     string
 	LogPath     string

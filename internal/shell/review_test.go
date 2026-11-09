@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -261,5 +262,25 @@ func TestSendMarks(t *testing.T) {
 	// Exec from code (no echoed line) keeps the confirmation line.
 	if l := s.Exec("msg nodeb bob code").Lines; len(l) != 1 || !strings.Contains(l[0].Text, "message sent to NODEB/BOB") {
 		t.Fatalf("%+v", l)
+	}
+}
+
+// TestSaveWithoutConfigFile: started with -o only, an explicit save
+// writes a new config file from the -o settings plus the change.
+func TestSaveWithoutConfigFile(t *testing.T) {
+	s, _ := newTestShell(t)
+	s.set.ConfigPath = filepath.Join(t.TempDir(), "gonje.cnf")
+	s.set.ConfigInit = "# gonje.cnf written by gonje from its -o options\nlocal_node=NODEA remote_host_name=NODEB remote_host_addr=b\n"
+	res := s.Exec("link define nodec 10.0.0.3 save")
+	if !strings.Contains(joinText(res.Lines), "saved to new config file "+s.set.ConfigPath) {
+		t.Fatalf("%+v", res.Lines)
+	}
+	c, err := config.Load(s.set.ConfigPath)
+	if err != nil || c.LocalNode != "NODEA" || c.Remote("NODEB") == nil || c.Remote("NODEC") == nil {
+		t.Fatalf("%+v %v", c, err)
+	}
+	if res := s.Exec("link change nodec keepalive=20 save"); !strings.Contains(joinText(res.Lines), "saved to "+s.set.ConfigPath) ||
+		strings.Contains(joinText(res.Lines), "new config file") {
+		t.Fatalf("%+v", res.Lines)
 	}
 }

@@ -28,6 +28,57 @@ type cliOpts struct {
 	wait    int      // -w: seconds to wait for command responses
 	mode    string   // "" = interactive, else send|cmd|msg (batch)
 	args    []string // batch operands
+	// opts: the -o strings (config tokens), in order; explicit: -c/-f
+	// named the config file (then it must exist even with -o).
+	opts     optList
+	explicit bool
+}
+
+// optList collects a repeatable string flag (-o).
+type optList []string
+
+func (l *optList) String() string     { return strings.Join(*l, " ") }
+func (l *optList) Set(v string) error { *l = append(*l, v); return nil }
+
+// expandOptions pulls every -o (or --o) group out of the command line,
+// wherever it is, so -o works without quotes:
+//
+//	gonje -o local_node=X remote_host_name=Y remote_host_addr=h -split=false
+//	gonje -c msg Y HERC01 hello -o local_node=X ...
+//
+// After -o every argument that holds a key=value token is taken (also
+// several tokens in one argument, split on blanks and commas, so the
+// quoted form and a=1,b=2 still work) until an argument that starts
+// with '-' or has no '='. A token with an unknown key is an error (a
+// typo must not end -o silently). Bare words inside a taken argument
+// (route=X,A,B) are left to the config parser. The groups come back as
+// "-o <arg>" pairs in front of the remaining arguments, in order.
+func expandOptions(args []string) ([]string, error) {
+	var opts, rest []string
+	for i := 0; i < len(args); i++ {
+		if args[i] != "-o" && args[i] != "--o" {
+			rest = append(rest, args[i])
+			continue
+		}
+		n := 0
+		for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], "=") {
+			i++
+			for _, f := range strings.FieldsFunc(args[i], func(r rune) bool {
+				return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == ','
+			}) {
+				k, _, ok := strings.Cut(f, "=")
+				if ok && !config.IsKey(k) {
+					return nil, fmt.Errorf("-o: unknown key in %q", config.MaskSecrets(f))
+				}
+			}
+			opts = append(opts, "-o", args[i])
+			n++
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("-o needs key=value tokens")
+		}
+	}
+	return append(opts, rest...), nil
 }
 
 // parseArgs reads the command line. -c is the config file, except that
@@ -35,6 +86,10 @@ type cliOpts struct {
 // config file in both modes.
 func parseArgs(args []string, stderr io.Writer) (*cliOpts, error) {
 	o := &cliOpts{}
+	args, err := expandOptions(args)
+	if err != nil {
+		return nil, err
+	}
 	fs := flag.NewFlagSet("gonje", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	c := fs.String("c", "", "config file, or batch action send|cmd|msg")
@@ -43,11 +98,18 @@ func parseArgs(args []string, stderr io.Writer) (*cliOpts, error) {
 	fs.Var(&o.split, "split", "start in split view (-split=false: single pane; default from config)")
 	fs.BoolVar(&o.version, "v", false, "print the version and exit")
 	fs.IntVar(&o.wait, "w", 30, "batch cmd: seconds to wait for responses")
+	fs.BoolVar(&batchVerbose, "verbose", false, "batch: show progress and other traffic on stderr")
+	fs.Var(&o.opts, "o", "config tokens as in gonje.cnf, in one quoted argument (repeatable); no config file needed")
 	fs.Usage = func() {
-		fmt.Fprint(stderr, `usage: gonje [-c|-f gonje.cnf] [-split=true|false] [-log gonje.log] [-v]
-       gonje [-f gonje.cnf] -c send <file> <node> <user>
-       gonje [-f gonje.cnf] -c cmd [-w secs] <node> <command>
-       gonje [-f gonje.cnf] -c msg <node> <user> <text>
+		fmt.Fprint(stderr, `usage: gonje [-c|-f gonje.cnf] [-o key=value ...] [-split=true|false] [-log gonje.log] [-v]
+       gonje [-f gonje.cnf] [-o "..."] -c send <file> <node> <user>
+       gonje [-f gonje.cnf] [-o "..."] -w <secs> -c cmd <node> <command>
+       gonje [-f gonje.cnf] [-o "..."] -c msg <node> <user> <text>
+-o local_node=ME local_port=1750 remote_host_name=PEER remote_host_addr=10.0.0.1
+   applies gonje.cnf keys after the config file (which is then optional);
+   quotes are optional (they only group several tokens)
+batch mode is quiet: stdout = the result (cmd responses), stderr = errors;
+   add -verbose to see progress and other traffic on stderr
 batch exit codes: 0 done, 1 error, 3 interrupted (SIGINT/SIGTERM)
 batch mode needs a direct link to <node> (no routing)
 `)
@@ -62,10 +124,10 @@ batch mode needs a direct link to <node> (no routing)
 		o.mode, o.args = *c, fs.Args()
 	case "":
 	default:
-		o.config = *c
+		o.config, o.explicit = *c, true
 	}
 	if *f != "" {
-		o.config = *f
+		o.config, o.explicit = *f, true
 	}
 	if o.wait < 1 {
 		return nil, fmt.Errorf("-w must be at least 1 second")
@@ -156,25 +218,61 @@ var batchSignals = func() (<-chan os.Signal, func()) {
 	return c, func() { signal.Stop(c) }
 }
 
+// batchVerbose (-verbose) makes batch mode print its progress and any
+// other incoming traffic on stderr. By default batch mode is quiet:
+// stdout carries only the result (command responses) and stderr only
+// errors, so a script gets exactly the answer. Everything is logged.
+var batchVerbose bool
+
+// say reports progress: always to the log, to stderr only with -verbose.
 func (b *batch) say(s string) {
-	fmt.Fprintln(b.out, "gonje: "+s)
+	if batchVerbose {
+		fmt.Fprintln(b.out, "gonje: "+s)
+	}
 	b.log.Info("batch: " + s)
 }
 
+// fail reports the error that ends the job; it is always printed.
 func (b *batch) fail(s string) int {
+	msg := "error: " + s
+	rc := exitError
 	if b.interrupted {
-		b.say("interrupted")
-		return exitInterrupted
+		msg, rc = "interrupted", exitInterrupted
 	}
-	b.say("error: " + s)
-	return exitError
+	fmt.Fprintln(b.out, "gonje: "+msg)
+	b.log.Info("batch: " + msg)
+	return rc
 }
 
-// show prints inbound traffic that arrives while connected.
+// batchStdout receives the RESULT of a batch job: the text of each
+// command response, one line per response line, so scripts can capture
+// it (gonje -o ... -c cmd NODE ... > out.txt). Progress, errors and other
+// inbound traffic stay on stderr. A variable so tests can capture it.
+var batchStdout io.Writer = os.Stdout
+
+// responseBody returns the message text of an inbound event, without
+// the "from NODE[/USER] to USER: " prefix the node puts in front.
+func responseBody(text string) string {
+	if strings.HasPrefix(text, "from ") {
+		if i := strings.Index(text, ": "); i >= 0 {
+			return text[i+2:]
+		}
+	}
+	return text
+}
+
+// show prints inbound traffic that arrives while connected: command
+// responses from the target node to stdout (the result), everything
+// else to stderr.
 func (b *batch) show(ev link.Event) {
 	switch ev.Kind {
 	case link.EvMsgIn, link.EvRspIn, link.EvCmdIn:
-		fmt.Fprintf(b.out, "%s: %s\n", ev.Node, ev.Text)
+		if ev.Kind == link.EvRspIn && ev.Node == b.j.node {
+			fmt.Fprintln(batchStdout, responseBody(ev.Text))
+		} else if batchVerbose {
+			// e.g. NJE38's "Signon of link ... complete" notice
+			fmt.Fprintf(b.out, "%s: %s\n", ev.Node, ev.Text)
+		}
 		if ev.Node == b.j.node && ev.Kind == link.EvRspIn {
 			// Only real responses count (the node classifies a message
 			// addressed to us after our command as one); an unrelated
@@ -381,6 +479,9 @@ func openLog(path string, cfg *config.Config, cfgPath string) (*logx.Logger, err
 	log, err := logx.Open(path, logx.ParseLevel(cfg.LogLevel))
 	if err != nil {
 		return nil, err
+	}
+	if cfgPath == "" {
+		cfgPath = "(none, -o only)"
 	}
 	log.Info(fmt.Sprintf("gonje %s starting as %s, config %s", node.Version, cfg.LocalNode, cfgPath))
 	for _, w := range cfg.Warnings {

@@ -297,12 +297,22 @@ func (s *Shell) saveConfig(edit func(f *config.File)) Line {
 		return errText("no config file to save to")
 	}
 	f, err := config.OpenFile(s.set.ConfigPath)
+	created := false
+	if os.IsNotExist(err) && s.set.ConfigInit != "" {
+		// Started with -o only: the explicit save writes a new file
+		// holding the -o settings plus this change.
+		f, err, created = config.NewFile(s.set.ConfigPath, s.set.ConfigInit), nil, true
+	}
 	if err != nil {
 		return errLine(err)
 	}
 	edit(f)
 	if err := f.Save(); err != nil {
 		return errLine(err)
+	}
+	if created {
+		s.set.ConfigInit = ""
+		return ok("saved to new config file " + s.set.ConfigPath + " (the -o settings plus this change)")
 	}
 	return ok("saved to " + s.set.ConfigPath)
 }

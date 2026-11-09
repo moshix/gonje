@@ -31,7 +31,7 @@ var helpTable = []helpEntry{
 		[]string{"opts: port=<n> keepalive=<s> password=<pw> strict_bcb=yes|no turn=free|strict buffersize=<n> max_streams=<n>",
 			"      line=<n> natin=<ip> natout=<ip> (NAT: inside / public address)",
 			"any node argument may also be a LINE number: line <n>, l<n> or <n>",
-			"save writes the link to the config file (-c)"},
+			"save writes the link to the config file (-c/-f; started with -o only, save creates it)"},
 		"link define NODEC 10.1.1.5 port=175 keepalive=10 save"},
 	{"Links", "link change", "<node> [addr] [opts] [save]", "change a link (used on next connect)",
 		[]string{"same options as link define; only the given ones change"},

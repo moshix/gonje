@@ -6,8 +6,9 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	"gonje/internal/config"
 )
 
 // DefaultHistoryPath returns ~/.gonje_history ("" if there is no home).
@@ -64,12 +65,6 @@ func AppendHistory(path, line string) {
 	}
 }
 
-// secretRE matches password=<value> and remote_password=<value> (any
-// case, '-' for '_') as a word of a command line.
-var secretRE = regexp.MustCompile(`(^|[\s,])((?i:remote[_-]password|password)=)[^\s,]*`)
-
 // maskSecrets replaces password values in a command line with "***",
 // for the log, the history and the echoed command.
-func maskSecrets(line string) string {
-	return secretRE.ReplaceAllString(line, "${1}${2}***")
-}
+func maskSecrets(line string) string { return config.MaskSecrets(line) }

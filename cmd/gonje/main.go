@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/term"
@@ -27,7 +28,7 @@ import (
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.7"
+var version = "0.8"
 
 func main() {
 	node.Version = version
@@ -55,18 +56,33 @@ func run() int {
 	cfgPath, logPath := &o.config, &o.logPath
 	split := o.split
 
-	cfg, err := config.Load(*cfgPath)
+	// -o tokens follow the config file; with -o the file is optional
+	// unless -c/-f named it.
+	cfg, hasFile, err := config.LoadWithOptions(*cfgPath, o.explicit || len(o.opts) == 0, o.opts)
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "-o") {
+			return fail(err.Error())
+		}
 		return fail(fmt.Sprintf("config %s: %v", *cfgPath, err))
+	}
+	// lockPath is the config file for the pid lock and port diagnosis
+	// ("" without a file: gonje.pid in the current directory).
+	lockPath := *cfgPath
+	if !hasFile {
+		lockPath = ""
 	}
 	if split.set {
 		cfg.SplitView = split.val
 	}
-	log, err := openLog(*logPath, cfg, *cfgPath)
+	log, err := openLog(*logPath, cfg, lockPath)
 	if err != nil {
 		return fail(err.Error())
 	}
 	defer log.Close()
+	for _, opt := range o.opts {
+		// Never the raw text: it may hold passwords.
+		log.Info("-o " + config.MaskSecrets(opt))
+	}
 
 	if o.mode != "" {
 		// Batch mode: one action, plain lines on stderr, no listener/UI.
@@ -74,14 +90,14 @@ func run() int {
 		if err != nil {
 			return fail(err.Error())
 		}
-		j.cfgPath = *cfgPath
+		j.cfgPath = lockPath
 		return runBatch(j, cfg, log, os.Stderr, node.Options{})
 	}
 
 	// One interactive gonje per config: the pid file next to the config
 	// is checked (and taken) before binding, so a second instance is
 	// refused even when it would bind another address.
-	lock, stale, err := instance.Acquire(*cfgPath, instance.NewInfo(version, cfg, *cfgPath))
+	lock, stale, err := instance.Acquire(lockPath, instance.NewInfo(version, cfg, lockPath))
 	if err != nil {
 		log.Error(err.Error())
 		return fail(err.Error())
@@ -93,7 +109,7 @@ func run() int {
 	defer lock.Release()
 	n := node.New(cfg, node.Options{Log: log})
 	if err := n.Listen(); err != nil {
-		msg := instance.Diagnose(cfg, *cfgPath, err)
+		msg := instance.Diagnose(cfg, lockPath, err)
 		log.Error("listen: " + msg)
 		return fail(msg)
 	}
@@ -112,6 +128,7 @@ func run() int {
 	sh := shell.New(n, shell.Settings{
 		Version:     version,
 		ConfigPath:  *cfgPath,
+		ConfigInit:  configInit(hasFile, o.opts),
 		Color:       term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == "",
 		Unicode:     shell.UseUnicode(os.Getenv),
 		SendDir:     cfg.SendDir,
@@ -160,4 +177,20 @@ func (o *optBool) Set(v string) error {
 	}
 	o.set, o.val = true, b
 	return nil
+}
+
+// configInit is the text of a new config file written by the shell's
+// "save" when gonje runs without one: the -o options, one token per line.
+func configInit(hasFile bool, opts []string) string {
+	if hasFile || len(opts) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("# gonje.cnf written by gonje from its -o options\n")
+	for _, o := range opts {
+		for _, line := range strings.Split(o, "\n") {
+			sb.WriteString(strings.TrimSpace(line) + "\n")
+		}
+	}
+	return sb.String()
 }
