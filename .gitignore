@@ -16,3 +16,7 @@ bin/
 
 # Claude Code local settings
 .claude/
+
+# Private deploy/remote-build scripts (not published)
+deploy.sh
+moshix.sh
