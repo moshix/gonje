@@ -231,14 +231,31 @@ type Buffer struct {
 func (b *Buffer) IsNull() bool { return len(b.Records) == 0 }
 
 // Encode builds the wire form: DLE STX, BCB, FCS, the records, RCB 00.
-// We always send DLE STX and never DLE ETB, and never double DLEs
-// (PLAN protocol decisions; spec 03 section 2.1).
+// It never sends DLE ETB and never doubles DLEs (PLAN protocol
+// decisions; spec 03 section 2.1). EncodeFramed can leave out the DLE
+// STX (only as a fallback: every known TCPNJE peer uses it).
+//
+// A buffer holding a single F0 control record (I/J signon, the other
+// NCC records, B signoff) ends at the record: no end-of-buffer RCB 00.
+// z/VM RSCS rejects the extra byte ("DMTTNE945E Protocol error ... code
+// 1818 -- data being received exceeds expected length"): the accepted I
+// in the Sine Nomine NJE / RSCS trace of 2026-11-09 is a 46-byte TTR
+// (5 bytes DLE STX BCB FCS + NCCIDL X'29' = 41), RSCS's J is the same,
+// and so are NJE38's own I and J. Ours had a 47th byte, X'00'. Data
+// and null buffers still end with RCB 00 (Sine Nomine's keepalive is
+// "10 02 81 8F CF 00").
 //
 // Non-F0 records are RCB SRCB followed by SCB-compressed data ending in
 // SCB 00. Stream control records with no data therefore become
 // "RCB SRCB 00" and EOF becomes "RCB 00 00" (spec 02 AMBIG-1).
-func (b *Buffer) Encode() []byte {
-	out := []byte{DLE, STX, b.BCB, b.FCS[0], b.FCS[1]}
+func (b *Buffer) Encode() []byte { return b.EncodeFramed(true) }
+
+// EncodeFramed is Encode with (dleSTX) or without the leading DLE STX.
+func (b *Buffer) EncodeFramed(dleSTX bool) []byte {
+	out := []byte{b.BCB, b.FCS[0], b.FCS[1]}
+	if dleSTX {
+		out = []byte{DLE, STX, b.BCB, b.FCS[0], b.FCS[1]}
+	}
 	for _, r := range b.Records {
 		out = append(out, r.RCB, r.SRCB)
 		if r.RCB == RCBControl {
@@ -250,6 +267,9 @@ func (b *Buffer) Encode() []byte {
 			continue
 		}
 		out = append(out, scb.Compress(r.Data)...)
+	}
+	if len(b.Records) == 1 && b.Records[0].RCB == RCBControl {
+		return out // F0 record alone: the buffer ends at NCCIDL
 	}
 	return append(out, RCBEOB)
 }

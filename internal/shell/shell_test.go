@@ -244,6 +244,7 @@ func (f *fakeBackend) SendFileNotify(n, u, p string, done func(error)) (*link.Ou
 	}
 	return &link.OutboundFile{Name: p, ToNode: n, ToUser: u, Records: make([][]byte, 3)}, nil
 }
+func (f *fakeBackend) ResetFraming(n string) error { return f.rec("reset-framing " + n) }
 func (f *fakeBackend) SetLocalName(n string) (int, error) {
 	if err := f.rec("name " + n); err != nil {
 		return 0, err

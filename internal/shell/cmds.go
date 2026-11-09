@@ -459,7 +459,7 @@ func applyLinkOpts(rc *config.Remote, words []string) error {
 func (s *Shell) linkCmd(args []string) Result {
 	args, save := stripSave(args)
 	if len(args) == 0 {
-		return usage("link define|change|delete|list ...")
+		return usage("link define|change|delete|list|reset-framing ...")
 	}
 	sub := strings.ToLower(args[0])
 	switch sub {
@@ -519,8 +519,17 @@ func (s *Shell) linkCmd(args []string) Result {
 			out = append(out, s.saveConfig(func(f *config.File) { f.DeleteRemote(name) }))
 		}
 		return Result{Lines: out}
+	case "reset-framing":
+		if len(args) != 2 {
+			return usage("link reset-framing <node>")
+		}
+		if err := s.be.ResetFraming(args[1]); err != nil {
+			return fail(err)
+		}
+		return Result{Lines: []Line{ok("framing of " + strings.ToUpper(args[1]) +
+			" forgotten: it is guessed and learned again on the next signon")}}
 	}
-	return usage("link define|change|delete|list ...")
+	return usage("link define|change|delete|list|reset-framing ...")
 }
 
 // routeCmd: route <dest> to <via> [alt <alt>] [save] | route delete

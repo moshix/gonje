@@ -168,7 +168,8 @@ func TestSignon(t *testing.T) {
 	if _, err := ParseSignon(SignoffRecord()); err == nil {
 		t.Fatal("signoff is not a signon")
 	}
-	if so := (&Buffer{BCB: 0x80, FCS: FCSNormal, Records: []Record{SignoffRecord()}}).Encode(); !bytes.Equal(so[5:], []byte{0xF0, 0xC2, 0x00}) {
+	if so := (&Buffer{BCB: 0x80, FCS: FCSNormal, Records: []Record{SignoffRecord()}}).Encode(); !bytes.Equal(so[5:], []byte{0xF0, 0xC2}) {
+		// An F0 record alone: no end-of-buffer RCB 00 (see EncodeFramed).
 		t.Fatalf("signoff % X", so)
 	}
 }

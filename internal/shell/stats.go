@@ -258,6 +258,7 @@ func (s *Shell) linkStats(l node.LinkCounters) []Line {
 		kv("state", state, stateColor(l.State)),
 		kv("address", addr, Default),
 		kv("nat in/out", orDash(l.NatIn)+" / "+orDash(l.NatOut), Default),
+		kv("framing", l.Framing, Default),
 		kv("session uptime", session, Default),
 		kv("connected total", fmtDur(l.Connected), Default),
 		kv("buffer size", bufText(l.BufSize, x.PeerBufSize), Default),

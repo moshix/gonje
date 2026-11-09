@@ -186,6 +186,7 @@ Anywhere a node is expected you may give its LINE number instead:
 | `link define <node> <addr\|-> [opts] [save]` | add a link (`-` = passive, only accept calls) |
 | `link change <node> [addr\|-] [opts] [save]` | change a link (used on the next connect) |
 | `link delete <node> [save]` | drop and remove a link (refused while a route uses it) |
+| `link reset-framing <node>` | forget the learned DLE STX framing of a link |
 | `route <dest> to <via> [alt <alt>] [save]` | reach a node through another link |
 | `route delete <dest> [save]`, `route list` (`routes`) | remove / list routes |
 | `route default <node>\|delete [save]` | set or remove the default route |
@@ -239,6 +240,29 @@ Other commands get "unsupported command".
   `drain` or `drop` again drops at once.
 - A file the peer does not confirm (C0) within 10 s counts as sent.
 - Records of 256 bytes or more are sent as spanned records.
+
+### Signon framing
+
+Every known TCPNJE peer (Hercules TCPNJE/NJE38, z/VM RSCS, Sine Nomine
+NJE) starts its buffers with `DLE STX` (X'1002'), and so does gonje. A
+buffer holding only a signon (or other F0 control) record ends right
+after that record, with no end-of-buffer `RCB 00`. z/VM RSCS rejects
+the extra byte with `DMTTNE945E ... code 1818`. Data and null buffers
+still end with `RCB 00`.
+
+As a safety net for unknown peers, gonje also:
+
+| Step | What gonje does |
+|---|---|
+| mirror | sends in the form of the peer's own buffers as soon as it sees one |
+| blind start | the form confirmed earlier, else DLE STX |
+| fallback | if the peer resets or ignores our signon, the other form is tried once, then DLE STX again; retries wait at least 5 s |
+| remember | a confirmed form is kept in `gonje.state` next to `gonje.pid` |
+
+`stats <node>` shows the form and how it was chosen (`learned`,
+`guessed`, `mirrored`). `link reset-framing <node>` forgets it.
+Received buffers are accepted in both forms, with or without the
+trailing `RCB 00`. Details: [DLE_STX.md](DLE_STX.md).
 
 ### LINE numbers
 

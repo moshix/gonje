@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,7 +29,7 @@ import (
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.8"
+var version = "0.9.1"
 
 func main() {
 	node.Version = version
@@ -71,6 +72,8 @@ func run() int {
 	if !hasFile {
 		lockPath = ""
 	}
+	// gonje.state (learned DLE STX framing) lives next to gonje.pid.
+	statePath := filepath.Join(filepath.Dir(instance.PidPath(lockPath)), node.StateFile)
 	if split.set {
 		cfg.SplitView = split.val
 	}
@@ -91,7 +94,7 @@ func run() int {
 			return fail(err.Error())
 		}
 		j.cfgPath = lockPath
-		return runBatch(j, cfg, log, os.Stderr, node.Options{})
+		return runBatch(j, cfg, log, os.Stderr, node.Options{StatePath: statePath})
 	}
 
 	// One interactive gonje per config: the pid file next to the config
@@ -107,7 +110,7 @@ func run() int {
 			stale.Started.Format("2006-01-02 15:04")))
 	}
 	defer lock.Release()
-	n := node.New(cfg, node.Options{Log: log})
+	n := node.New(cfg, node.Options{Log: log, StatePath: statePath})
 	if err := n.Listen(); err != nil {
 		msg := instance.Diagnose(cfg, lockPath, err)
 		log.Error("listen: " + msg)

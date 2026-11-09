@@ -75,6 +75,11 @@ type Params struct {
 	// default, remote_turn=free): send whenever we have data.
 	StrictTurn bool
 	MaxJob     int // max bytes buffered per inbound job
+	// Framing: whether our buffers start with DLE STX (see framing.go).
+	// FramingAuto = DLE STX.
+	Framing    Framing
+	FramingSrc string // FramingLearned, FramingGuessed (default)
+	FramingWhy string // reason for the log ("confirmed earlier", "default")
 	Log        *logx.Logger
 	Handler    Handler
 }
@@ -153,6 +158,17 @@ type Session struct {
 	// run once that buffer has been written to the socket.
 	nmrSent []func(error)
 
+	// Framing (framing.go): dleSTX is the form we send; mirrored is set
+	// once the peer's first data buffer told us its form. iSent and
+	// framingRejected track a signon I the peer did not answer.
+	fmu             sync.Mutex
+	dleSTX          bool
+	framingSrc      string
+	framingWhy      string
+	mirrored        bool
+	iSent           bool
+	framingRejected bool
+
 	// --- cross-goroutine plumbing ---
 	inCh    chan []byte
 	errCh   chan error
@@ -188,6 +204,7 @@ func New(conn net.Conn, p Params) *Session {
 	}
 	s.initTx()
 	s.ourFCS = streamFCS(p.MaxStreams)
+	s.initFraming()
 	return s
 }
 
@@ -354,6 +371,7 @@ func (s *Session) sendLine(seq []byte) error {
 // enabled": gonje never throttles its peer.
 func (s *Session) sendBuffer(recs []records.Record) error {
 	b := &records.Buffer{BCB: 0x80 | s.outSeq, FCS: s.ourFCS, Records: recs}
+	dle, _, _ := s.Framing()
 	s.outSeq = (s.outSeq + 1) & 0x0F
 	if len(recs) == 0 {
 		s.emit(EvKeepalive, L3, "keepalive ->")
@@ -362,7 +380,7 @@ func (s *Session) sendBuffer(recs []records.Record) error {
 	for _, r := range recs {
 		s.dumpRecord("->", r)
 	}
-	s.lastBlock = b.Encode()
+	s.lastBlock = b.EncodeFramed(dle)
 	return s.sendRaw(s.lastBlock)
 }
 
@@ -468,13 +486,23 @@ func (s *Session) SignonPrimary() error {
 }
 
 // primaryIJ sends I and waits for J.
+//
+// We send first, so the framing is a choice made blind (framing.go). If
+// the peer resets, closes, refuses or stays silent instead of answering
+// with J, that form is reported as rejected (FramingRejected) so the
+// node tries the other form next time.
 func (s *Session) primaryIJ() error {
+	s.announceFraming()
 	if err := s.sendBuffer([]records.Record{s.signonRecord(records.SRCBSignonI, nil)}); err != nil {
 		return err
 	}
+	s.fmu.Lock()
+	s.iSent = true
+	s.fmu.Unlock()
 	s.emit(EvSignon, L2, fmt.Sprintf("signon I sent (we are primary, bufsz=%d)", s.p.BufSize))
 	j, err := s.waitSignon(records.SRCBSignonJ)
 	if err != nil {
+		s.rejectFraming(err)
 		return err
 	}
 	s.finishSignon(j, true)
@@ -499,6 +527,8 @@ func (s *Session) SignonSecondary() error {
 			return err
 		}
 	case records.KindSYNNAK:
+		// The peer leaves the primary role to us (z/VM RSCS does): we
+		// send our I first, in the form chosen at the start.
 		if err := s.sendLine(records.SOHENQ); err != nil {
 			return err
 		}
@@ -542,6 +572,7 @@ func (s *Session) waitSignon(want byte) (*records.Signon, error) {
 		if k != records.KindBuffer {
 			return nil, fmt.Errorf("expected signon buffer, got %s", k)
 		}
+		s.mirrorFraming(rec)
 		buf, err := records.Decode(rec)
 		if err != nil && buf == nil {
 			return nil, err
@@ -590,6 +621,9 @@ func (s *Session) finishSignon(peer *records.Signon, primary bool) {
 	if primary {
 		role = "primary"
 	}
+	s.fmu.Lock()
+	s.iSent = false // answered: the framing is confirmed
+	s.fmu.Unlock()
 	// One line, logged by the event bus.
 	s.emit(EvSignon, L2, fmt.Sprintf("signon complete as %s: %s, buffer limit %d", role, peer, s.bufLimit))
 }

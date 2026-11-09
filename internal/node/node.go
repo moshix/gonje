@@ -79,6 +79,12 @@ type Options struct {
 	StreamSettle time.Duration
 	User         string // local user id for origin fields
 	Log          *logx.Logger
+	// StatePath: gonje.state, where the DLE STX framing learned per
+	// remote is kept ("" = remember in memory only).
+	StatePath string
+	// RejectRetry: the least wait before redialling a peer that rejected
+	// our signon I (default 5 s; no tight reconnect loop).
+	RejectRetry time.Duration
 }
 
 func (o *Options) defaults() {
@@ -102,6 +108,9 @@ func (o *Options) defaults() {
 	}
 	if o.StableAfter == 0 {
 		o.StableAfter = time.Minute
+	}
+	if o.RejectRetry == 0 {
+		o.RejectRetry = 5 * time.Second
 	}
 	if o.DialHandshake == 0 {
 		o.DialHandshake = min(15*time.Second, o.Handshake)
@@ -158,6 +167,14 @@ type remote struct {
 	connStart time.Time     // start of the live session (or last reset)
 	rspIn     int
 	rspOut    int
+
+	// DLE STX framing (framing.go): learned is the confirmed form (nil =
+	// not known); next overrides it after the peer rejected a form;
+	// triedOther: the fallback was used in this connect window (reset by
+	// a signon or by "connect"), so it is not tried again.
+	learned    *bool
+	next       *bool
+	triedOther bool
 }
 
 // Node is a running gonje NJE node.
@@ -181,6 +198,8 @@ type Node struct {
 	lnmu  sync.Mutex
 	lines map[string]int // remote name -> LINE number (event lines)
 
+	stmu sync.Mutex // serializes gonje.state writes
+
 	mu       sync.Mutex
 	accepted int       // inbound connections signed on (stats)
 	rejected int       // inbound OPENs answered with NAK (stats)
@@ -199,6 +218,7 @@ func New(cfg *config.Config, opts Options) *Node {
 	n := &Node{cfg: cfg, opts: opts, log: opts.Log, bus: NewBus(opts.Log), start: time.Now(), since: time.Now(),
 		ctx: ctx, cancel: cancel, remotes: map[string]*remote{}}
 	_ = config.AssignLines(cfg.Remotes) // configs built in code (tests) get lines too
+	defer n.loadFraming()
 	n.lines = map[string]int{}
 	for _, r := range cfg.Remotes {
 		n.setLine(r.Name, r.Line, false)
@@ -731,6 +751,7 @@ func (n *Node) dialLocked(r *remote) {
 	addr := net.JoinHostPort(r.cfg.Addr, strconv.Itoa(r.cfg.Port))
 	p := n.paramsLocked(r)
 	p.Handshake = n.opts.DialHandshake
+	n.framingLocked(r, &p) // we dial: our I goes first
 	d := net.Dialer{Timeout: 10 * time.Second}
 	if r.cfg.NatIn != "" {
 		// Behind NAT: dial from our inside address for this link.
@@ -775,7 +796,7 @@ func (n *Node) dialWorker(r *remote, gen int, addr string, d net.Dialer, p link.
 	s := link.New(conn, p)
 	if err := s.SignonPrimary(); err != nil {
 		_ = conn.Close()
-		n.attemptFailed(r, gen, err, 0)
+		n.attemptFailed(r, gen, err, n.framingFailed(r, s))
 		return
 	}
 	if !stop() {
@@ -833,6 +854,7 @@ func (n *Node) backoffLocked(r *remote) time.Duration {
 
 // established makes a signed-on session the active link.
 func (n *Node) established(r *remote, gen int, s *link.Session) {
+	n.framingConfirmed(r, s)
 	n.mu.Lock()
 	if gen != r.gen || n.stopping {
 		n.mu.Unlock()
@@ -1046,6 +1068,7 @@ func (n *Node) handleInbound(c net.Conn) {
 	r.gen++
 	gen := r.gen
 	params := n.paramsLocked(r)
+	n.framingLocked(r, &params)
 	if r.retry != nil {
 		r.retry.Stop()
 	}
@@ -1068,7 +1091,7 @@ func (n *Node) handleInbound(c net.Conn) {
 	s := link.New(c, params)
 	if err := s.SignonSecondary(); err != nil {
 		_ = c.Close()
-		n.attemptFailed(r, gen, err, 0)
+		n.attemptFailed(r, gen, err, n.framingFailed(r, s))
 		return
 	}
 	n.established(r, gen, s)
@@ -1093,6 +1116,7 @@ func (n *Node) Connect(name string) error {
 	if err != nil {
 		return err
 	}
+	r.triedOther = false // a new connect window for the framing fallback
 	if r.cfg.Addr == "" {
 		return fmt.Errorf("%s has no remote_host_addr; waiting for it to connect", r.cfg.Name)
 	}

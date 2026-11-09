@@ -471,6 +471,7 @@ func (s *Session) handleInbound(rec []byte, now time.Time) error {
 	case records.KindSOHENQ:
 		return ErrPeerRestart
 	case records.KindBuffer:
+		s.mirrorFraming(rec)
 	default:
 		// NAK / SYN NAK / garbage after signon: CTC rules say take the
 		// link down on NAK; we stay tolerant, log it and keep alternating.

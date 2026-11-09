@@ -158,6 +158,9 @@ type Stats struct {
 	RecordsOut   int
 	BCBErrors    int // inbound BCB sequence errors
 	NAKsIn       int // NAK / SYN NAK received after signon
+	// Framing: the form we send and how it was chosen, e.g.
+	// "DLE STX (mirrored)" (snapshot field, see framing.go).
+	Framing string
 }
 
 // Add returns the field-by-field sum of the counters (snapshot fields

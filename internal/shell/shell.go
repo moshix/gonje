@@ -40,6 +40,7 @@ type Backend interface {
 	DeleteRoute(dest string) error
 	SetDefaultRoute(name string) error
 	ResetCounters(name string) error
+	ResetFraming(name string) error
 }
 
 // Settings are the shell's static parameters.
