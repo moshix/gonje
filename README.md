@@ -342,6 +342,51 @@ gonje.cnf is needed (`local_node` is required):
 | end | the link is closed without signoff |
 | exit code | 0 done, 1 error, 3 interrupted (SIGINT/SIGTERM) |
 
+### Example: a sendfile script
+
+`sendfile.sh` sends the file named on its command line to user HERC01
+on HOUCICS, the NJE38 node on this machine (10.157.58.220, port 4002).
+It needs no gonje.cnf; a second argument picks another user:
+
+    #!/bin/sh
+    # Usage: ./sendfile.sh <file> [user]
+    # Sends <file> to <user> (default HERC01) on HOUCICS with gonje batch send.
+    set -eu
+
+    if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+        echo "usage: $0 <file> [user]" >&2
+        exit 2
+    fi
+    file=$1
+    user=${2:-HERC01}
+
+    # Check the file here, so a typo gives a clear error before any dial.
+    if [ ! -r "$file" ]; then
+        echo "$0: cannot read $file" >&2
+        exit 1
+    fi
+    # start.sh changes into the gonje directory, so make the path absolute.
+    case $file in
+        /*) ;;
+        *) file=$(pwd)/$file ;;
+    esac
+
+    # -o defines the local node and the HOUCICS link inline. local_port
+    # is where batch mode also listens for HOUCICS calling back; if the
+    # interactive gonje already holds it, batch mode only dials.
+    exec "$(dirname "$0")/start.sh" \
+        -o local_node=MOSHIX local_IP=10.157.58.220 local_port=1750 \
+           remote_host_name=HOUCICS remote_host_addr=10.157.58.220 \
+           remote_host_port=4002 \
+        -c send "$file" HOUCICS "$user"
+
+    ./sendfile.sh report.txt           # to HERC01
+    ./sendfile.sh report.txt HERC02    # to another user
+
+Keep the script next to `start.sh`. The exit code is gonje's (0 sent,
+1 error). To see the link come up and the transfer on stderr, add
+`-verbose` before `-c` (flags after the `send` operands are not read).
+
 ## Logging
 
 Everything goes to the log file (mode 0600): operator commands and
