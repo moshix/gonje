@@ -25,7 +25,7 @@ type cliOpts struct {
 	logPath string
 	split   optBool
 	version bool
-	wait    int      // -w: seconds to wait for command responses
+	wait    int      // -w: seconds to wait for the first command response
 	mode    string   // "" = interactive, else send|cmd|msg (batch)
 	args    []string // batch operands
 	// opts: the -o strings (config tokens), in order; explicit: -c/-f
@@ -97,7 +97,7 @@ func parseArgs(args []string, stderr io.Writer) (*cliOpts, error) {
 	fs.StringVar(&o.logPath, "log", "gonje.log", "log file")
 	fs.Var(&o.split, "split", "start in split view (-split=false: single pane; default from config)")
 	fs.BoolVar(&o.version, "v", false, "print the version and exit")
-	fs.IntVar(&o.wait, "w", 30, "batch cmd: seconds to wait for responses")
+	fs.IntVar(&o.wait, "w", 4, "batch cmd: seconds to wait for the first response")
 	fs.BoolVar(&batchVerbose, "verbose", false, "batch: show progress and other traffic on stderr")
 	fs.Var(&o.opts, "o", "config tokens as in gonje.cnf, in one quoted argument (repeatable); no config file needed")
 	fs.Usage = func() {
@@ -145,7 +145,7 @@ type batchJob struct {
 	user  string
 	file  string
 	text  string
-	wait  time.Duration // cmd: total wait for responses
+	wait  time.Duration // cmd: wait this long for the first response
 	quiet time.Duration // cmd: finish this long after the last response
 	grace time.Duration // msg: wait after the NMR was written
 	setup time.Duration // connect + signon timeout
@@ -161,7 +161,7 @@ type batchJob struct {
 //	msg  <node> <user> <text...>
 func newBatchJob(o *cliOpts) (*batchJob, error) {
 	j := &batchJob{mode: o.mode, wait: time.Duration(o.wait) * time.Second,
-		quiet: 5 * time.Second, grace: time.Second, setup: 60 * time.Second}
+		quiet: time.Second, grace: time.Second, setup: 60 * time.Second}
 	a := o.args
 	switch o.mode {
 	case "send":
@@ -409,6 +409,22 @@ func (b *batch) msg() int {
 	return 0
 }
 
+// responseCap bounds how long a cmd keeps reading once responses flow
+// (a node that streams lines less than quiet apart would never go quiet).
+const responseCap = 2 * time.Minute
+
+// cmdDone decides when a batch cmd stops waiting. NJE has no "end of
+// response" marker, so silence is the only signal:
+//   - no response yet: give up wait after the command was sent;
+//   - responses arrived: finish once quiet has passed since the last
+//     one (the reply lines of one command come in a quick burst).
+func cmdDone(got int, sent, last, now time.Time, wait, quiet time.Duration) bool {
+	if got == 0 {
+		return now.Sub(sent) >= wait
+	}
+	return now.Sub(last) >= quiet
+}
+
 func (b *batch) cmd() int {
 	before := b.stats().CmdsOut
 	b.got = 0
@@ -419,9 +435,12 @@ func (b *batch) cmd() int {
 		return b.fail("command not sent: " + err.Error())
 	}
 	b.say("command sent to " + b.j.node + ", waiting for responses")
-	// Responses can take 10-30 s: wait up to j.wait in total, but once
-	// one has arrived, finish after j.quiet without another one.
-	err := b.waitEvent(b.j.wait, nil, func() bool { return b.got > 0 && time.Since(b.last) >= b.j.quiet })
+	sent := time.Now()
+	// The deadline is only a safety cap for a node that never stops
+	// talking; the tick below normally ends the wait (see cmdDone).
+	err := b.waitEvent(b.j.wait+responseCap, nil, func() bool {
+		return cmdDone(b.got, sent, b.last, time.Now(), b.j.wait, b.j.quiet)
+	})
 	got := b.got
 	if got == 0 {
 		return b.fail(fmt.Sprintf("no response from %s within %s", b.j.node, b.j.wait))

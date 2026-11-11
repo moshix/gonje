@@ -79,3 +79,33 @@ func TestOptionsValidation(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+
+// TestOptionsRemoteKeyOrder: remote_* keys given before the
+// remote_host_name on the command line still belong to that remote.
+func TestOptionsRemoteKeyOrder(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gonje.cnf")
+	for _, opts := range [][]string{
+		{"remote_password=sekret local_node=ME remote_host_addr=h remote_host_name=PEER"},
+		{"remote_password=sekret", "remote_host_name=PEER", "local_node=ME", "remote_host_addr=h"},
+		{"local_node=ME remote_host_name=PEER remote_password=sekret remote_host_addr=h"},
+	} {
+		c, _, err := LoadWithOptions(missing, false, opts)
+		if err != nil {
+			t.Fatalf("%q: %v", opts, err)
+		}
+		r := c.Remote("PEER")
+		if len(c.Remotes) != 1 || r == nil || r.Password != "SEKRET" || r.Addr != "h" {
+			t.Errorf("%q: remotes %+v", opts, c.Remotes)
+		}
+	}
+	// With a file, leading keys go to the named remote, not the file's last.
+	p := filepath.Join(t.TempDir(), "gonje.cnf")
+	os.WriteFile(p, []byte("local_node=ME\nremote_host_name=A\nremote_host_addr=a\n"), 0o644)
+	c, _, err := LoadWithOptions(p, true, []string{"remote_keepalive=30 remote_host_name=B remote_host_addr=b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Remote("A").Keepalive != 10 || c.Remote("B").Keepalive != 30 {
+		t.Errorf("keepalive A=%d B=%d", c.Remote("A").Keepalive, c.Remote("B").Keepalive)
+	}
+}

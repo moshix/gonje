@@ -76,7 +76,7 @@ remote.
 | `-split=false` | start with a single pane (default from `split_view`) |
 | `-log <file>` | log file (gonje.log) |
 | `-v` | print `gonje <version>` and exit |
-| `-w <s>` | batch `cmd`: seconds to wait for responses (30) |
+| `-w <s>` | batch `cmd`: seconds to wait for the first response (4) |
 
 `-o` takes the same `key=value` tokens as gonje.cnf (separated by
 spaces or commas; `remote_host_name` starts a remote block):
@@ -329,7 +329,7 @@ gonje.cnf is needed (`local_node` is required):
     gonje -o local_node=MOSHIX remote_host_name=HOUCICS remote_host_addr=10.157.58.220 remote_host_port=4002 -c cmd HOUCICS D T > result.txt
 
     gonje -c send file.txt NODEID USERID
-    gonje -c cmd NODEID cp q users       # waits for responses (-w <s>, 30)
+    gonje -c cmd NODEID cp q users       # waits for responses (-w <s>, 4)
     gonje -c msg NODEID USERID hello how are you?
     gonje -v                             # prints "gonje <version>"
 
@@ -338,7 +338,7 @@ gonje.cnf is needed (`local_node` is required):
 | config | `gonje.cnf`, or `-f <file>` |
 | target | must be a directly linked remote (no routing) |
 | connect | dials the node and also listens for its call. If the port is busy (for example, the interactive gonje is running), it only dials and says who has the port |
-| `cmd` | ends 5 s after the last response, or after `-w` seconds |
+| `cmd` | ends 1 s after the last response, or after `-w` seconds without any |
 | end | the link is closed without signoff |
 | exit code | 0 done, 1 error, 3 interrupted (SIGINT/SIGTERM) |
 

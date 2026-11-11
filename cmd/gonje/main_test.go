@@ -66,14 +66,14 @@ func TestParseArgs(t *testing.T) {
 		version    bool
 		wait       int
 	}{
-		{nil, "", "gonje.cnf", nil, false, 30},
-		{[]string{"-c", "my.cnf"}, "", "my.cnf", nil, false, 30},
-		{[]string{"-f", "my.cnf", "-split=false"}, "", "my.cnf", nil, false, 30},
-		{[]string{"-c", "send", "file.txt", "NODEID", "USERID"}, "send", "gonje.cnf", []string{"file.txt", "NODEID", "USERID"}, false, 30},
-		{[]string{"-f", "o.cnf", "-c", "send", "f", "N", "U"}, "send", "o.cnf", []string{"f", "N", "U"}, false, 30},
+		{nil, "", "gonje.cnf", nil, false, 4},
+		{[]string{"-c", "my.cnf"}, "", "my.cnf", nil, false, 4},
+		{[]string{"-f", "my.cnf", "-split=false"}, "", "my.cnf", nil, false, 4},
+		{[]string{"-c", "send", "file.txt", "NODEID", "USERID"}, "send", "gonje.cnf", []string{"file.txt", "NODEID", "USERID"}, false, 4},
+		{[]string{"-f", "o.cnf", "-c", "send", "f", "N", "U"}, "send", "o.cnf", []string{"f", "N", "U"}, false, 4},
 		{[]string{"-w", "10", "-c", "cmd", "NODEID", "cp", "q", "users"}, "cmd", "gonje.cnf", []string{"NODEID", "cp", "q", "users"}, false, 10},
-		{[]string{"-c", "msg", "NODEID", "USERID", "hello", "how", "are", "you?"}, "msg", "gonje.cnf", []string{"NODEID", "USERID", "hello", "how", "are", "you?"}, false, 30},
-		{[]string{"-v"}, "", "gonje.cnf", nil, true, 30},
+		{[]string{"-c", "msg", "NODEID", "USERID", "hello", "how", "are", "you?"}, "msg", "gonje.cnf", []string{"NODEID", "USERID", "hello", "how", "are", "you?"}, false, 4},
+		{[]string{"-v"}, "", "gonje.cnf", nil, true, 4},
 	}
 	for _, c := range cases {
 		o, err := parseArgs(c.args, io.Discard)
@@ -104,6 +104,33 @@ func TestParseArgs(t *testing.T) {
 	j, _ := newBatchJob(&cliOpts{mode: "cmd", wait: 30, args: []string{"houcics", "cp", "q", "users"}})
 	if j.node != "HOUCICS" || j.text != "cp q users" {
 		t.Fatalf("%+v", j)
+	}
+	// cmd ends 1 s after the last response line (NJE has no end marker).
+	if j.quiet != time.Second {
+		t.Errorf("quiet = %s, want 1s", j.quiet)
+	}
+}
+
+func TestCmdDone(t *testing.T) {
+	t0 := time.Now()
+	wait, quiet := 4*time.Second, time.Second
+	cases := []struct {
+		got       int
+		last, now time.Duration // offsets from the send time t0
+		want      bool
+	}{
+		{0, 0, 3900 * time.Millisecond, false}, // no response, still within wait
+		{0, 0, 4 * time.Second, true},          // no response: give up at wait
+		{1, 2 * time.Second, 2900 * time.Millisecond, false},
+		{1, 2 * time.Second, 3 * time.Second, true}, // 1 s quiet after a response
+		// Responses keep the wait open past wait while they keep coming.
+		{5, 4500 * time.Millisecond, 5 * time.Second, false},
+		{5, 4500 * time.Millisecond, 5500 * time.Millisecond, true},
+	}
+	for _, c := range cases {
+		if d := cmdDone(c.got, t0, t0.Add(c.last), t0.Add(c.now), wait, quiet); d != c.want {
+			t.Errorf("%+v: done=%v", c, d)
+		}
 	}
 }
 

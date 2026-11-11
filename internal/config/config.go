@@ -346,13 +346,15 @@ func LoadWithOptions(path string, required bool, opts []string) (c *Config, hasF
 	case required || len(opts) == 0 || !os.IsNotExist(err):
 		return nil, false, err
 	}
+	var optToks []token
 	for _, o := range opts {
 		ot, err := tokenizeSrc(strings.NewReader(o), "-o")
 		if err != nil {
 			return nil, hasFile, err
 		}
-		toks = append(toks, ot...)
+		optToks = append(optToks, ot...)
 	}
+	toks = append(toks, hoistRemoteName(optToks)...)
 	if c, err = build(toks); err != nil {
 		return nil, hasFile, err
 	}
@@ -363,6 +365,34 @@ func LoadWithOptions(path string, required bool, opts []string) (c *Config, hasF
 		return nil, hasFile, err
 	}
 	return c, hasFile, nil
+}
+
+// hoistRemoteName makes the order of keys on the command line not
+// matter: remote_* keys given before the first remote_host_name of the
+// -o tokens (e.g. "remote_password=x remote_host_name=Y") belong to
+// that remote, so the remote_host_name token is moved in front of
+// them. Keys after a remote_host_name keep belonging to it, as in the
+// file. Without any remote_host_name the tokens are left as they are
+// (they then extend the file's last remote, or fail in build).
+func hoistRemoteName(toks []token) []token {
+	first := -1 // index of the first remote_* key with no name before it
+	for i, t := range toks {
+		if t.key == "remote_host_name" {
+			if first < 0 {
+				return toks // a name already precedes every remote_* key
+			}
+			// Rotate toks[first..i] so the name comes first; the
+			// non-remote keys in between are order-independent.
+			out := append([]token{}, toks[:first]...)
+			out = append(out, t)
+			out = append(out, toks[first:i]...)
+			return append(out, toks[i+1:]...)
+		}
+		if first < 0 && strings.HasPrefix(t.key, "remote_") {
+			first = i
+		}
+	}
+	return toks
 }
 
 func (c *Config) validate() error {
