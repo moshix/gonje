@@ -410,6 +410,31 @@ func (k LineKind) String() string {
 // Classify tells line-control sequences apart from data buffers. A data
 // buffer starts with DLE STX or directly with a BCB (high bit set).
 func Classify(rec []byte) LineKind {
+	// Some peers (PUBNET, a VM/370 node) end a line-control sequence with
+	// BSC pad bytes X'FF': DLE ACK0 arrives as 10 70 FF. Pad bytes are not
+	// part of the sequence, so they are ignored here. The trimmed form is
+	// used only when it IS one of those sequences, so a data buffer that
+	// happens to end in X'FF' is still a buffer.
+	if ctl := trimPad(rec); len(ctl) < len(rec) {
+		if k := classifyExact(ctl); k == KindSOHENQ || k == KindDLEACK0 ||
+			k == KindSYNNAK || k == KindNAK {
+			return k
+		}
+	}
+	return classifyExact(rec)
+}
+
+// trimPad returns rec without its trailing BSC pad bytes (X'FF').
+func trimPad(rec []byte) []byte {
+	n := len(rec)
+	for n > 0 && rec[n-1] == 0xFF {
+		n--
+	}
+	return rec[:n]
+}
+
+// classifyExact classifies rec as it is, pad bytes included.
+func classifyExact(rec []byte) LineKind {
 	switch {
 	case len(rec) == 2 && rec[0] == SOH && rec[1] == ENQ:
 		return KindSOHENQ

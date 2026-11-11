@@ -29,7 +29,7 @@ import (
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.9.3"
+var version = "0.9.4"
 
 func main() {
 	node.Version = version

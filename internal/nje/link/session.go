@@ -470,19 +470,89 @@ func (s *Session) signonRecord(srcb byte, peer *records.Signon) records.Record {
 // SignonPrimary runs the connecting side's signon (spec 01 section 3.5):
 //
 //	-> SOH ENQ   <- DLE ACK0   -> I   <- J
+//
+// The peer may also answer our SOH ENQ with SYN NAK (it leaves the
+// primary role to us) or with its own SOH ENQ (it bids too); see
+// signonPrimaryReply.
 func (s *Session) SignonPrimary() error {
 	if err := s.sendLine(records.SOHENQ); err != nil {
 		return err
 	}
+	return s.signonPrimaryReply()
+}
+
+// maxSYNNAKRetries bounds how often we repeat our SOH ENQ to a peer that
+// answers it with SYN NAK. A peer that keeps doing so will never let the
+// signon finish; the BSC init rules (spec 03 section 7.1, Table 62:
+// "rewrite SOH ENQ") are bounded too.
+const maxSYNNAKRetries = 3
+
+// signonPrimaryReply reads the peer's answer to the SOH ENQ we just sent.
+//
+//   - DLE ACK0: we are primary (the node that RECEIVES DLE ACK0 sends I,
+//     spec 03 section 7.1).
+//   - SYN NAK: the peer leaves the choice to us. We bid again with SOH
+//     ENQ, at most maxSYNNAKRetries times.
+//   - SOH ENQ: contention, both sides bid. The TCP/IP chapter only says
+//     JES closes the connection; the BSC rule (spec 03 section 7.1) is
+//     that the side whose SOH ENQ ARRIVES FIRST becomes secondary. The
+//     peer's SOH ENQ came after ours reached it (it is its answer), so
+//     ours arrived first and we yield: DLE ACK0, then the secondary half
+//     (wait for I, send J). funetnje does the same in its start state.
+//
+// Anything else ends the attempt.
+func (s *Session) signonPrimaryReply() error {
+	for naks := 0; ; naks++ {
+		rec, err := s.readRecordTimeout()
+		if err != nil {
+			return fmt.Errorf("waiting for DLE ACK0: %w", err)
+		}
+		switch k := records.Classify(rec); k {
+		case records.KindDLEACK0:
+			s.emit(EvDump, L3, "<- DLE ACK0", ebcdic.HexDump(rec)...)
+			return s.primaryIJ()
+		case records.KindSYNNAK:
+			s.emit(EvDump, L3, "<- SYN NAK", ebcdic.HexDump(rec)...)
+			if naks >= maxSYNNAKRetries {
+				return fmt.Errorf("no DLE ACK0, peer answered SYN NAK %d times", naks+1)
+			}
+			if err := s.sendLine(records.SOHENQ); err != nil {
+				return err
+			}
+		case records.KindSOHENQ:
+			s.emit(EvDump, L3, "<- SOH ENQ (contention: we yield)", ebcdic.HexDump(rec)...)
+			return s.yieldPrimary()
+		default:
+			return fmt.Errorf("expected DLE ACK0 after SOH ENQ, got %s", k)
+		}
+	}
+}
+
+// yieldPrimary answers the peer's SOH ENQ (contention) with DLE ACK0 and
+// continues as secondary.
+//
+// Double-yield guard: a peer with the same rule also yields, so it
+// answers our SOH ENQ with DLE ACK0 while we wait for its I. Waiting on
+// would deadlock (each side waits for the other's I). The node that
+// receives DLE ACK0 is primary, so in that case we take the role and
+// send our I. This happens once only: from then on primaryIJ waits for
+// J and any other answer ends the attempt.
+func (s *Session) yieldPrimary() error {
+	if err := s.sendLine(records.DLEACK0); err != nil {
+		return err
+	}
 	rec, err := s.readRecordTimeout()
 	if err != nil {
-		return fmt.Errorf("waiting for DLE ACK0: %w", err)
+		return fmt.Errorf("waiting for signon: %w", err)
 	}
-	if k := records.Classify(rec); k != records.KindDLEACK0 {
-		return fmt.Errorf("expected DLE ACK0 after SOH ENQ, got %s", k)
+	if records.Classify(rec) == records.KindDLEACK0 {
+		s.emit(EvDump, L3, "<- DLE ACK0 (peer yielded too: we are primary)", ebcdic.HexDump(rec)...)
+		return s.primaryIJ()
 	}
-	s.emit(EvDump, L3, "<- DLE ACK0", ebcdic.HexDump(rec)...)
-	return s.primaryIJ()
+	// Not DLE ACK0: put the record back in front of the rest of its
+	// block, so the secondary half reads it (normally the peer's I).
+	s.pending = append([][]byte{rec}, s.pending...)
+	return s.secondaryIJ()
 }
 
 // primaryIJ sends I and waits for J.
@@ -528,21 +598,23 @@ func (s *Session) SignonSecondary() error {
 		}
 	case records.KindSYNNAK:
 		// The peer leaves the primary role to us (z/VM RSCS does): we
-		// send our I first, in the form chosen at the start.
+		// bid with SOH ENQ and from then on act as the dialling side
+		// does, so its answer may also be SYN NAK or SOH ENQ.
 		if err := s.sendLine(records.SOHENQ); err != nil {
 			return err
 		}
-		rec, err := s.readRecordTimeout()
-		if err != nil {
-			return err
-		}
-		if k := records.Classify(rec); k != records.KindDLEACK0 {
-			return fmt.Errorf("expected DLE ACK0 after our SOH ENQ, got %s", k)
-		}
-		return s.primaryIJ()
+		return s.signonPrimaryReply()
 	default:
 		return fmt.Errorf("expected SOH ENQ or SYN NAK, got %s", k)
 	}
+	return s.secondaryIJ()
+}
+
+// secondaryIJ is the secondary's half after our DLE ACK0 went out: wait
+// for I, answer J. Shared by SignonSecondary and by a dial that lost the
+// contention (yieldPrimary). The J goes out in the form of the peer's I
+// (waitSignon mirrors it).
+func (s *Session) secondaryIJ() error {
 	i, err := s.waitSignon(records.SRCBSignonI)
 	if err != nil {
 		return err

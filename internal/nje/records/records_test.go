@@ -129,6 +129,31 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// Line-control sequences padded with X'FF' (PUBNET, a VM/370 node,
+// answers SOH ENQ with 10 70 FF) classify as the sequence, while a buffer
+// ending in X'FF' stays a buffer and pure pad stays unknown.
+func TestClassifyPadded(t *testing.T) {
+	cases := []struct {
+		rec  []byte
+		want LineKind
+	}{
+		{[]byte{DLE, ACK0, 0xFF}, KindDLEACK0},       // the captured reply
+		{[]byte{DLE, ACK0, 0xFF, 0xFF}, KindDLEACK0}, // several pads
+		{[]byte{SOH, ENQ, 0xFF}, KindSOHENQ},         // contention, padded
+		{[]byte{SYN, NAK, 0xFF}, KindSYNNAK},         // SYN NAK, padded
+		{[]byte{NAK, 0xFF}, KindNAK},                 // NAK, padded
+		{[]byte{0x80, 0x8F, 0xFF}, KindBuffer},       // 3-byte buffer ending FF
+		{[]byte{0x10, 0x02, 0x80, 0x8F, 0xFF}, KindBuffer},
+		{[]byte{0xFF}, KindUnknown},       // pad only
+		{[]byte{0x05, 0xFF}, KindUnknown}, // not a sequence
+	}
+	for _, c := range cases {
+		if got := Classify(c.rec); got != c.want {
+			t.Errorf("Classify(% X) = %s, want %s", c.rec, got, c.want)
+		}
+	}
+}
+
 func TestSignon(t *testing.T) {
 	s := &Signon{SRCB: SRCBSignonI, Node: "nodea", Qual: 1, BufSize: 8192,
 		NodePW: "SECRET"}
