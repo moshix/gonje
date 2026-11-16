@@ -8,6 +8,19 @@ It connects to other NJE nodes (RSCS, JES2, NJE38, another gonje), sends
 and receives messages, commands and files, and lets you do that through
 an operator shell or in batch mode.
 
+
+## What it is good for??
+
+With goNJE you can set up NJE connections quickly and ad-hoc. For example you can use 
+goNJE to upload a file to your MVS 3.8 mainframe or to your VM/SP instance. 
+
+Or, you can use goNJE to see who is connected to your z/OS mainframe or z/VM system by
+executing a remote NJE command. 
+
+Some people also use goNJE to send and receive VM NOTES mail. 
+
+Finally, you can use goNJE to connect and execute remote commands on the 3270BBS. 
+  
 ## Build
 
     go build -o gonje ./cmd/gonje
@@ -84,7 +97,7 @@ spaces or commas; `remote_host_name` starts a remote block):
     gonje -o local_node=MOSHIX local_IP=10.157.58.220 local_port=1750 remote_host_name=HOUCICS remote_host_addr=10.157.58.220 remote_host_port=4002
     gonje -o local_node=MOSHIX remote_host_name=HOUCICS remote_host_addr=10.157.58.220 -c msg HOUCICS HERC01 hello
 
-- `-o` takes every following `key=value` argument up to the next
+- `-o` takes every folowing `key=value` argument up to the next
   argument that starts with `-` or has no `=`. It may come before or
   after other flags, and after `-c send|cmd|msg` and its operands.
 - A token with an unknown key (a typo) is an error.
@@ -115,7 +128,7 @@ same port.
 
 ## Screen
 
-On a terminal gonje uses the whole screen (Unicode frames, or ASCII when
+On a termial gonje uses the whole screen (Unicode frames, or ASCII when
 the locale is not UTF-8 or `GONJE_ASCII=1`) and restores it on exit.
 Colors follow `NO_COLOR`. Piped (non-tty) use prints plain lines.
 
