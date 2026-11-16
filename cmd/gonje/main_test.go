@@ -520,3 +520,26 @@ func TestBatchQuietByDefault(t *testing.T) {
 		t.Fatalf("rc %d stderr %q", rc, stderr.String())
 	}
 }
+
+// TestStripLoader covers Termux starting gonje via the Android linker,
+// which leaves the linker in argv[0] and the program path in argv[1].
+func TestStripLoader(t *testing.T) {
+	cases := []struct {
+		in, want []string
+	}{
+		{[]string{"/system/bin/linker64", "/data/data/com.termux/files/home/gonje"},
+			[]string{"/data/data/com.termux/files/home/gonje"}},
+		{[]string{"/system/bin/linker64", "./gonje", "-c", "cmd", "N", "Q"},
+			[]string{"./gonje", "-c", "cmd", "N", "Q"}},
+		{[]string{"/system/bin/linker", "gonje", "-v"}, []string{"gonje", "-v"}},
+		{[]string{"./gonje", "-v"}, []string{"./gonje", "-v"}},
+		{[]string{"./gonje"}, []string{"./gonje"}},
+		{[]string{"linker64"}, []string{"linker64"}},
+	}
+	for _, c := range cases {
+		got := stripLoader(c.in)
+		if strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("stripLoader(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

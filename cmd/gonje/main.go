@@ -29,7 +29,7 @@ import (
 
 // version is the gonje release version. build.sh reads this line to
 // name the binaries, so keep the form: var version = "x.y"
-var version = "0.9.4"
+var version = "0.9.5"
 
 func main() {
 	node.Version = version
@@ -42,8 +42,26 @@ func fail(msg string) int {
 	return 1
 }
 
+// stripLoader removes the Android dynamic linker from the front of argv.
+// Termux (termux-exec) runs binaries in the app data dir, which is
+// mounted noexec on newer Android, as "/system/bin/linker64 <prog> args".
+// A bionic-linked program never notices because the linker shifts argv
+// before libc init, but a Go binary built with CGO_ENABLED=0 reads argv
+// straight off the initial stack, so os.Args[0] is the linker and
+// os.Args[1] is the program path. Dropping the linker restores the
+// normal layout: [prog, args...].
+func stripLoader(args []string) []string {
+	if len(args) >= 2 {
+		switch filepath.Base(args[0]) {
+		case "linker64", "linker":
+			return args[1:]
+		}
+	}
+	return args
+}
+
 func run() int {
-	o, err := parseArgs(os.Args[1:], os.Stderr)
+	o, err := parseArgs(stripLoader(os.Args)[1:], os.Stderr)
 	if err != nil {
 		if err == flag.ErrHelp {
 			return 0
