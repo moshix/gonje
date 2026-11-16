@@ -521,25 +521,32 @@ func TestBatchQuietByDefault(t *testing.T) {
 	}
 }
 
-// TestStripLoader covers Termux starting gonje via the Android linker,
-// which leaves the linker in argv[0] and the program path in argv[1].
+// TestStripLoader covers Termux running gonje via the Android linker:
+// argv keeps the typed argv[0] and gets the full program path inserted
+// as argv[1], while /proc/self/exe points at the linker.
 func TestStripLoader(t *testing.T) {
+	const linker = "/apex/com.android.runtime/bin/linker64"
+	const full = "/data/data/com.termux/files/home/gonje"
 	cases := []struct {
-		in, want []string
+		in   []string
+		exe  string
+		want []string
 	}{
-		{[]string{"/system/bin/linker64", "/data/data/com.termux/files/home/gonje"},
-			[]string{"/data/data/com.termux/files/home/gonje"}},
-		{[]string{"/system/bin/linker64", "./gonje", "-c", "cmd", "N", "Q"},
-			[]string{"./gonje", "-c", "cmd", "N", "Q"}},
-		{[]string{"/system/bin/linker", "gonje", "-v"}, []string{"gonje", "-v"}},
-		{[]string{"./gonje", "-v"}, []string{"./gonje", "-v"}},
-		{[]string{"./gonje"}, []string{"./gonje"}},
-		{[]string{"linker64"}, []string{"linker64"}},
+		// the exact shapes observed on the phone
+		{[]string{"./gonje", full}, linker, []string{"./gonje"}},
+		{[]string{"./gonje", full, "-v"}, linker, []string{"./gonje", "-v"}},
+		{[]string{full, full, "-c", "cmd", "N", "Q"}, linker,
+			[]string{full, "-c", "cmd", "N", "Q"}},
+		{[]string{"gonje", full, "-v"}, "/system/bin/linker", []string{"gonje", "-v"}},
+		// started normally: leave args alone
+		{[]string{"./gonje", "-v"}, full, []string{"./gonje", "-v"}},
+		{[]string{"./gonje", "-v"}, "", []string{"./gonje", "-v"}},
+		{[]string{"./gonje"}, linker, []string{"./gonje"}},
 	}
 	for _, c := range cases {
-		got := stripLoader(c.in)
+		got := stripLoader(c.in, c.exe)
 		if strings.Join(got, "|") != strings.Join(c.want, "|") {
-			t.Errorf("stripLoader(%q) = %q, want %q", c.in, got, c.want)
+			t.Errorf("stripLoader(%q, %q) = %q, want %q", c.in, c.exe, got, c.want)
 		}
 	}
 }

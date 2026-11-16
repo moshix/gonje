@@ -33,6 +33,7 @@ var version = "0.9.5"
 
 func main() {
 	node.Version = version
+	setupResolver()
 	os.Exit(run())
 }
 
@@ -42,26 +43,39 @@ func fail(msg string) int {
 	return 1
 }
 
-// stripLoader removes the Android dynamic linker from the front of argv.
-// Termux (termux-exec) runs binaries in the app data dir, which is
-// mounted noexec on newer Android, as "/system/bin/linker64 <prog> args".
-// A bionic-linked program never notices because the linker shifts argv
-// before libc init, but a Go binary built with CGO_ENABLED=0 reads argv
-// straight off the initial stack, so os.Args[0] is the linker and
-// os.Args[1] is the program path. Dropping the linker restores the
-// normal layout: [prog, args...].
-func stripLoader(args []string) []string {
-	if len(args) >= 2 {
-		switch filepath.Base(args[0]) {
-		case "linker64", "linker":
-			return args[1:]
-		}
+// stripLoader undoes the argv shape Termux produces on Android 10+.
+// The app data dir may not be exec'd directly, so termux-exec (an
+// LD_PRELOAD in the shell) runs "./gonje a b" as
+//
+//	execve("/apex/.../linker64", ["./gonje", "/full/path/gonje", "a", "b"])
+//
+// i.e. it keeps the typed argv[0] and inserts the program's full path for
+// the linker to load. A bionic-linked program never notices because the
+// linker drops that slot before libc init, but a Go binary built with
+// CGO_ENABLED=0 reads argv straight off the initial stack and sees the
+// extra path as os.Args[1]. Verified on a phone (Android 17, Termux):
+// os.Args = ["./probe" "/data/data/com.termux/files/home/probe" "a" "b"]
+// with /proc/self/exe -> /apex/com.android.runtime/bin/linker64.
+//
+// The linker never appears in argv, so the only reliable sign is the
+// running executable (exe, from /proc/self/exe) being the linker. Then
+// args[1] is the inserted path and is dropped: [argv0, a, b].
+func stripLoader(args []string, exe string) []string {
+	if len(args) < 2 {
+		return args
+	}
+	switch filepath.Base(exe) {
+	case "linker64", "linker":
+		return append([]string{args[0]}, args[2:]...)
 	}
 	return args
 }
 
 func run() int {
-	o, err := parseArgs(stripLoader(os.Args)[1:], os.Stderr)
+	// Readlink fails on systems without /proc (macOS); exe is then ""
+	// and stripLoader leaves args alone.
+	exe, _ := os.Readlink("/proc/self/exe")
+	o, err := parseArgs(stripLoader(os.Args, exe)[1:], os.Stderr)
 	if err != nil {
 		if err == flag.ErrHelp {
 			return 0
