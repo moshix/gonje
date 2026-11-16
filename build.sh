@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build gonje for Linux amd64, Linux arm64 and macOS arm64 into bin/.
+# Build gonje for Linux amd64, Linux arm64, Android arm64 (Termux) and
+# macOS arm64 into bin/.
 # The version is taken from the global `version` variable in
 # cmd/gonje/main.go and put into each binary's name.
 # Usage: ./build.sh
@@ -16,7 +17,11 @@ fi
 mkdir -p bin
 
 # CGO off so the Linux binaries are static and cross-compile from macOS.
-for target in linux/amd64 linux/arm64 darwin/arm64; do
+# android/arm64 is separate from linux/arm64: Android's bionic loader
+# rejects plain Linux arm64 binaries (e.g. "TLS segment is underaligned"),
+# while GOOS=android builds a PIE that runs under /system/bin/linker64
+# and so works in Termux.
+for target in linux/amd64 linux/arm64 android/arm64 darwin/arm64; do
     os=${target%/*}
     arch=${target#*/}
     out="bin/gonje-$version-$os-$arch"

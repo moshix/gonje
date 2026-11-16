@@ -15,7 +15,7 @@ an operator shell or in batch mode.
 
 | Script | What it does |
 |---|---|
-| `./build.sh` | builds `bin/gonje-<version>-<os>-<arch>` for linux/amd64, linux/arm64 and darwin/arm64 (static, CGO off) |
+| `./build.sh` | builds `bin/gonje-<version>-<os>-<arch>` for linux/amd64, linux/arm64, android/arm64 (Termux) and darwin/arm64 (CGO off) |
 | `./start.sh [args]` | runs the highest-version binary in `bin/` for this machine; arguments go to gonje, e.g. `./start.sh -c test/nodeA.cnf` |
 
 ## Configure
