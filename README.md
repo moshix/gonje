@@ -286,6 +286,8 @@ free number, or `line=<n>`.
 
 ### NAT
 
+Damn NAT.... breaks so many systems. But wait, with goNJE you can overcome NATness!
+  
 Behind NAT, gonje dials out and uses that one connection both ways. Set
 `remote_natin` to our private address (the dial source) and
 `remote_natout` to our public address (sent to the peer in OPEN and
